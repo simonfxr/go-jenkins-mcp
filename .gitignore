@@ -1,0 +1,5 @@
+/.direnv
+/go-jenkins-mcp
+
+*.local.env
+*.log
