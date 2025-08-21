@@ -37,6 +37,14 @@
     - `max_length` (optional, default: 8192) - Maximum number of bytes to retrieve from the end
   - Returns: JSON object with tail log content and metadata
 
+- Tool: `start_job`
+  - Description: Trigger a Jenkins job build with optional parameters and wait options
+  - Arguments:
+    - `job_name` (required) - Name/path of the Jenkins job (supports folders)
+    - `parameters` (optional) - Object map of build parameters
+    - `wait` (optional, default: `none`) - One of `none`, `queued`, `started`
+  - Returns: JSON with `jobName`, `queueUrl` (if available), and for `wait=started`, `buildUrl` and `buildNumber`
+
 **Job Format**
 Each job returned by `get_jobs` includes:
 ```json

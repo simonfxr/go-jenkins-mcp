@@ -26,6 +26,7 @@ const (
 	getRunningBuildsToolName   = "get_running_builds"
 	getBuildLogsToolName       = "get_build_logs"
 	getBuildLogsSuffixToolName = "get_build_logs_suffix"
+	startJobToolName           = "start_job"
 )
 
 // getJobsArgs are the tool arguments for get_jobs.
@@ -56,6 +57,22 @@ type getBuildLogsSuffixArgs struct {
 	JobName     string `json:"job_name"`
 	BuildNumber int    `json:"build_number"`
 	MaxLength   int    `json:"max_length,omitempty"`
+}
+
+// startJobArgs are the tool arguments for start_job.
+type startJobArgs struct {
+	JobName    string                 `json:"job_name"`
+	Parameters map[string]interface{} `json:"parameters,omitempty"`
+	// wait: "none" (default), "queued", or "started"
+	Wait string `json:"wait,omitempty"`
+}
+
+// StartJobResponse represents the response from start_job
+type StartJobResponse struct {
+	JobName     string `json:"jobName"`
+	QueueURL    string `json:"queueUrl,omitempty"`
+	BuildURL    string `json:"buildUrl,omitempty"`
+	BuildNumber int    `json:"buildNumber,omitempty"`
 }
 
 // BuildLogsResponse represents the response from get_build_logs
@@ -222,7 +239,6 @@ func main() {
 	if p, ok := getJobInputSchema.Properties["name"]; ok && p != nil {
 		p.Description = "Name of the Jenkins job to retrieve"
 	}
-	getJobInputSchema.Required = append(getJobInputSchema.Required, "name")
 
 	mcp.AddTool[getJobArgs, any](server, &mcp.Tool{
 		Name:        getJobToolName,
@@ -316,7 +332,6 @@ func main() {
 		p.Description = "Maximum number of bytes to retrieve (default: 8192)"
 		p.Default = json.RawMessage("8192")
 	}
-	getBuildLogsInputSchema.Required = append(getBuildLogsInputSchema.Required, "name", "build_number")
 
 	mcp.AddTool[getBuildLogsArgs, any](server, &mcp.Tool{
 		Name:        getBuildLogsToolName,
@@ -386,7 +401,6 @@ func main() {
 		p.Description = "Maximum number of bytes to retrieve from the end of the log (default: 8192)"
 		p.Default = json.RawMessage("8192")
 	}
-	getBuildLogsSuffixInputSchema.Required = append(getBuildLogsSuffixInputSchema.Required, "job_name", "build_number")
 
 	mcp.AddTool[getBuildLogsSuffixArgs, any](server, &mcp.Tool{
 		Name:        getBuildLogsSuffixToolName,
@@ -435,6 +449,62 @@ func main() {
 		}, nil
 	})
 
+	// Build input schema for start_job tool
+	startJobInputSchema, err := jsonschema.For[startJobArgs](nil)
+	if err != nil {
+		log.Fatalf("build start_job input schema: %v", err)
+	}
+	if startJobInputSchema.Properties == nil {
+		startJobInputSchema.Properties = make(map[string]*jsonschema.Schema)
+	}
+	if p, ok := startJobInputSchema.Properties["job_name"]; ok && p != nil {
+		p.Description = "Name/path of the Jenkins job (supports folders)"
+	}
+	if p, ok := startJobInputSchema.Properties["parameters"]; ok && p != nil {
+		p.Description = "Build parameters as a key/value object"
+	}
+	if p, ok := startJobInputSchema.Properties["wait"]; ok && p != nil {
+		p.Description = "When to return: 'none' (default), 'queued', or 'started'"
+	}
+
+	mcp.AddTool[startJobArgs, any](server, &mcp.Tool{
+		Name:        startJobToolName,
+		Description: "Trigger a Jenkins job build with optional parameters and wait behavior",
+		InputSchema: startJobInputSchema,
+	}, func(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[startJobArgs]]) (*mcp.CallToolResultFor[any], error) {
+		args := req.Params.Arguments
+		if strings.TrimSpace(args.JobName) == "" {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: "Missing required argument: job_name"}},
+				IsError: true,
+			}, nil
+		}
+		if args.Wait == "" {
+			args.Wait = "none"
+		}
+		switch args.Wait {
+		case "none", "queued", "started":
+		default:
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: "Invalid wait value: expected 'none', 'queued', or 'started'"}},
+				IsError: true,
+			}, nil
+		}
+
+		res, err := startJob(ctx, opts, args.JobName, args.Parameters, args.Wait)
+		if err != nil {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+				IsError: true,
+			}, nil
+		}
+
+		b, _ := json.Marshal(res)
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		}, nil
+	})
+
 	// Choose transport
 	if httpAddr != "" {
 		handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server }, nil)
@@ -470,6 +540,156 @@ func buildJobPath(jobName string) string {
 		b.WriteString(url.PathEscape(s))
 	}
 	return b.String()
+}
+
+// getCrumb fetches Jenkins CSRF crumb and header field name.
+func getCrumb(ctx context.Context, opts *JenkinsOptions) (field, crumb string, ok bool, err error) {
+	apiURL := strings.TrimRight(opts.URL, "/") + "/crumbIssuer/api/json"
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return "", "", false, err
+	}
+	req.SetBasicAuth(opts.User, opts.Token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := opts.Client.Do(req)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// Crumbs disabled
+		return "", "", false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Don't fail build start if crumb endpoint errors; treat as no crumb
+		return "", "", false, nil
+	}
+	var data struct {
+		Field string `json:"crumbRequestField"`
+		Crumb string `json:"crumb"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", "", false, nil
+	}
+	if data.Field == "" || data.Crumb == "" {
+		return "", "", false, nil
+	}
+	return data.Field, data.Crumb, true, nil
+}
+
+// startJob triggers a Jenkins job, optionally with parameters, and optionally waits.
+func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params map[string]interface{}, wait string) (*StartJobResponse, error) {
+	jobPath := buildJobPath(jobName)
+	base := strings.TrimRight(opts.URL, "/")
+	var endpoint string
+	if len(params) > 0 {
+		endpoint = base + jobPath + "/buildWithParameters"
+	} else {
+		endpoint = base + jobPath + "/build"
+	}
+
+	form := url.Values{}
+	for k, v := range params {
+		form.Set(k, fmt.Sprint(v))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create build request: %w", err)
+	}
+	req.SetBasicAuth(opts.User, opts.Token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if f, c, ok, _ := getCrumb(ctx, opts); ok {
+		req.Header.Set(f, c)
+	}
+
+	resp, err := opts.Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start build: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Jenkins returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// Capture queue URL from Location header if present
+	queueURL := resp.Header.Get("Location")
+	result := &StartJobResponse{JobName: jobName}
+	if queueURL != "" {
+		result.QueueURL = queueURL
+	}
+
+	switch wait {
+	case "none":
+		return result, nil
+	case "queued":
+		// We already have queue URL (if provided). Return now.
+		return result, nil
+	case "started":
+		if queueURL == "" {
+			return result, nil // cannot wait without queue URL
+		}
+		// Poll queue item until executable is assigned
+		// Use a reasonable default timeout
+		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-waitCtx.Done():
+				return result, nil
+			case <-ticker.C:
+				qreq, err := http.NewRequestWithContext(waitCtx, "GET", strings.TrimRight(queueURL, "/")+"/api/json", nil)
+				if err != nil {
+					return result, nil
+				}
+				qreq.SetBasicAuth(opts.User, opts.Token)
+				qreq.Header.Set("Accept", "application/json")
+				qresp, err := opts.Client.Do(qreq)
+				if err != nil {
+					continue
+				}
+				func() {
+					defer qresp.Body.Close()
+					if qresp.StatusCode != http.StatusOK {
+						return
+					}
+					var q struct {
+						Cancelled  bool `json:"cancelled"`
+						Executable *struct {
+							Number int    `json:"number"`
+							URL    string `json:"url"`
+						} `json:"executable"`
+					}
+					if err := json.NewDecoder(qresp.Body).Decode(&q); err != nil {
+						return
+					}
+					if q.Cancelled {
+						// leave result without build info
+						return
+					}
+					if q.Executable != nil {
+						result.BuildNumber = q.Executable.Number
+						result.BuildURL = q.Executable.URL
+						// done
+						cancel()
+					}
+				}()
+			}
+			if waitCtx.Err() != nil {
+				return result, nil
+			}
+			if result.BuildNumber > 0 || result.BuildURL != "" {
+				return result, nil
+			}
+		}
+	default:
+		return result, nil
+	}
 }
 
 // getBuildLogsSuffix fetches the tail/suffix of build logs from Jenkins API
