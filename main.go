@@ -21,12 +21,13 @@ import (
 )
 
 const (
-	getJobsToolName            = "get_jobs"
-	getJobToolName             = "get_job"
-	getRunningBuildsToolName   = "get_running_builds"
-	getBuildLogsToolName       = "get_build_logs"
-	getBuildLogsSuffixToolName = "get_build_logs_suffix"
-	startJobToolName           = "start_job"
+	getJobsToolName             = "get_jobs"
+	getJobToolName              = "get_job"
+	getRunningBuildsToolName    = "get_running_builds"
+	getBuildLogsToolName        = "get_build_logs"
+	getBuildLogsSuffixToolName  = "get_build_logs_suffix"
+	startJobToolName            = "start_job"
+	waitForRunningBuildToolName = "wait_for_running_build"
 )
 
 // getJobsArgs are the tool arguments for get_jobs.
@@ -67,12 +68,30 @@ type startJobArgs struct {
 	Wait string `json:"wait,omitempty"`
 }
 
+// waitForRunningBuildArgs are the tool arguments for wait_for_running_build.
+type waitForRunningBuildArgs struct {
+	JobName        string `json:"job_name"`
+	BuildNumber    int    `json:"build_number"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
 // StartJobResponse represents the response from start_job
 type StartJobResponse struct {
 	JobName     string `json:"jobName"`
 	QueueURL    string `json:"queueUrl,omitempty"`
 	BuildURL    string `json:"buildUrl,omitempty"`
 	BuildNumber int    `json:"buildNumber,omitempty"`
+}
+
+// WaitForRunningBuildResponse represents the response from wait_for_running_build
+type WaitForRunningBuildResponse struct {
+	JobName     string `json:"jobName"`
+	BuildNumber int    `json:"buildNumber"`
+	Status      string `json:"status"`   // "success", "failure", "unstable", "aborted", "timeout"
+	Result      string `json:"result"`   // Jenkins result string (SUCCESS, FAILURE, UNSTABLE, ABORTED, or empty if timeout)
+	Duration    int64  `json:"duration"` // Total build duration in milliseconds
+	WaitTime    int64  `json:"waitTime"` // Time spent waiting in milliseconds
+	TimedOut    bool   `json:"timedOut"` // Whether the wait operation timed out
 }
 
 // BuildLogsResponse represents the response from get_build_logs
@@ -505,6 +524,60 @@ func main() {
 		}, nil
 	})
 
+	// Build input schema for wait_for_running_build tool
+	waitForRunningBuildInputSchema, err := jsonschema.For[waitForRunningBuildArgs](nil)
+	if err != nil {
+		log.Fatalf("build wait_for_running_build input schema: %v", err)
+	}
+	if waitForRunningBuildInputSchema.Properties == nil {
+		waitForRunningBuildInputSchema.Properties = make(map[string]*jsonschema.Schema)
+	}
+	if p, ok := waitForRunningBuildInputSchema.Properties["job_name"]; ok && p != nil {
+		p.Description = "Name of the Jenkins job"
+	}
+	if p, ok := waitForRunningBuildInputSchema.Properties["build_number"]; ok && p != nil {
+		p.Description = "Build number to wait for"
+	}
+	if p, ok := waitForRunningBuildInputSchema.Properties["timeout_seconds"]; ok && p != nil {
+		p.Description = "Maximum time to wait in seconds (default: 600)"
+	}
+
+	mcp.AddTool[waitForRunningBuildArgs, any](server, &mcp.Tool{
+		Name:        waitForRunningBuildToolName,
+		Description: "Wait for a running Jenkins build to complete or timeout",
+		InputSchema: waitForRunningBuildInputSchema,
+	}, func(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[waitForRunningBuildArgs]]) (*mcp.CallToolResultFor[any], error) {
+		args := req.Params.Arguments
+		if strings.TrimSpace(args.JobName) == "" {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: "Missing required argument: job_name"}},
+				IsError: true,
+			}, nil
+		}
+		if args.BuildNumber <= 0 {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: "Missing or invalid required argument: build_number"}},
+				IsError: true,
+			}, nil
+		}
+		if args.TimeoutSeconds <= 0 {
+			args.TimeoutSeconds = 600 // Default 10 minutes
+		}
+
+		res, err := waitForRunningBuild(ctx, opts, args.JobName, args.BuildNumber, args.TimeoutSeconds)
+		if err != nil {
+			return &mcp.CallToolResultFor[any]{
+				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
+				IsError: true,
+			}, nil
+		}
+
+		b, _ := json.Marshal(res)
+		return &mcp.CallToolResultFor[any]{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		}, nil
+	})
+
 	// Choose transport
 	if httpAddr != "" {
 		handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server }, nil)
@@ -582,19 +655,19 @@ func getCrumb(ctx context.Context, opts *JenkinsOptions) (field, crumb string, o
 func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params map[string]interface{}, wait string) (*StartJobResponse, error) {
 	jobPath := buildJobPath(jobName)
 	base := strings.TrimRight(opts.URL, "/")
-	var endpoint string
-	if len(params) > 0 {
-		endpoint = base + jobPath + "/buildWithParameters"
-	} else {
-		endpoint = base + jobPath + "/build"
-	}
+
+	// Always use buildWithParameters endpoint as it works for both parameterized and non-parameterized jobs
+	endpoint := base + jobPath + "/buildWithParameters"
 
 	form := url.Values{}
 	for k, v := range params {
 		form.Set(k, fmt.Sprint(v))
 	}
+	// If no parameters provided, still send the form (empty is fine for buildWithParameters)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(form.Encode()))
+	body := strings.NewReader(form.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create build request: %w", err)
 	}
@@ -1237,6 +1310,80 @@ func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild
 	}
 
 	return runningBuilds, nil
+}
+
+// waitForRunningBuild waits for a Jenkins build to complete or timeout
+func waitForRunningBuild(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, timeoutSeconds int) (*WaitForRunningBuildResponse, error) {
+	startTime := time.Now()
+	timeout := time.Duration(timeoutSeconds) * time.Second
+	pollInterval := 5 * time.Second // Poll every 5 seconds
+
+	// Create a context with timeout
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Build the build URL
+	jobPath := buildJobPath(jobName)
+	buildURL := fmt.Sprintf("%s%s/%d", strings.TrimRight(opts.URL, "/"), jobPath, buildNumber)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
+			// Timeout occurred
+			waitTime := time.Since(startTime).Milliseconds()
+			return &WaitForRunningBuildResponse{
+				JobName:     jobName,
+				BuildNumber: buildNumber,
+				Status:      "timeout",
+				Result:      "",
+				Duration:    0,
+				WaitTime:    waitTime,
+				TimedOut:    true,
+			}, nil
+
+		case <-ticker.C:
+			// Poll the build status
+			build, err := getBuildDetails(ctx, opts, buildURL)
+			if err != nil {
+				// If we can't get build details, continue polling
+				// This might happen if the build hasn't started yet
+				continue
+			}
+
+			// Check if build is complete
+			if !build.Building {
+				waitTime := time.Since(startTime).Milliseconds()
+
+				// Map Jenkins result to our status
+				var status string
+				switch build.Result {
+				case "SUCCESS":
+					status = "success"
+				case "FAILURE":
+					status = "failure"
+				case "UNSTABLE":
+					status = "unstable"
+				case "ABORTED":
+					status = "aborted"
+				default:
+					status = "unknown"
+				}
+
+				return &WaitForRunningBuildResponse{
+					JobName:     jobName,
+					BuildNumber: buildNumber,
+					Status:      status,
+					Result:      build.Result,
+					Duration:    build.Duration,
+					WaitTime:    waitTime,
+					TimedOut:    false,
+				}, nil
+			}
+		}
+	}
 }
 
 // parseJobNameAndBuildNumber extracts job name and build number from Jenkins full display name

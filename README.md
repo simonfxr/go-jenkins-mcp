@@ -45,6 +45,14 @@
     - `wait` (optional, default: `none`) - One of `none`, `queued`, `started`
   - Returns: JSON with `jobName`, `queueUrl` (if available), and for `wait=started`, `buildUrl` and `buildNumber`
 
+- Tool: `wait_for_running_build`
+  - Description: Wait for a running Jenkins build to complete or timeout
+  - Arguments:
+    - `job_name` (required) - Name of the Jenkins job
+    - `build_number` (required) - Build number to wait for
+    - `timeout_seconds` (optional, default: 600) - Maximum time to wait in seconds
+  - Returns: JSON object with build completion status and timing information
+
 **Job Format**
 Each job returned by `get_jobs` includes:
 ```json
@@ -111,6 +119,28 @@ Build logs returned by `get_build_logs` include:
 }
 ```
 
+**Wait for Build Format**
+Build wait results returned by `wait_for_running_build` include:
+```json
+{
+  "jobName": "job-name",
+  "buildNumber": 124,
+  "status": "success",
+  "result": "SUCCESS",
+  "duration": 120000,
+  "waitTime": 45000,
+  "timedOut": false
+}
+```
+
+Status values:
+- `success`: Build completed successfully
+- `failure`: Build failed
+- `unstable`: Build completed but with test failures or warnings
+- `aborted`: Build was manually aborted
+- `timeout`: Wait operation timed out before build completed
+- `unknown`: Build completed with an unrecognized result
+
 **Jenkins Color Codes**
 - `blue`: Last build was successful
 - `red`: Last build failed
@@ -163,9 +193,8 @@ Examples:
 - If `-stdio=false` and no `-http` is provided, the server exits with an error.
 
 **TODO**
-- Add more Jenkins tools (build job, get build status, get build logs, etc.)
+- Add more Jenkins tools (get build status, etc.)
 - Add filtering options (by job name pattern, status, etc.)
-- Add support for Jenkins folders and nested jobs
 - Add support for Jenkins CSRF protection
 - Add SSL certificate validation options
 - Add caching for better performance
