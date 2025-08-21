@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,9 +9,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -81,8 +82,12 @@ type RunningBuild struct {
 
 // JenkinsOptions bundles configuration for Jenkins API calls.
 type JenkinsOptions struct {
-	URL  string
-	Auth string // format: "user:api_token"
+	URL        string
+	Auth       string // format: "user:api_token" (kept for backward compatibility)
+	User       string
+	Token      string
+	Client     *http.Client
+	LogsClient *http.Client
 }
 
 // JenkinsJob represents a Jenkins job with its current status
@@ -141,7 +146,7 @@ func main() {
 	flag.StringVar(&opts.URL, "url", "", "Jenkins URL (required)")
 	flag.StringVar(&opts.Auth, "auth", "", "Jenkins authentication in format 'user:api_token' (required)")
 	flag.StringVar(&httpAddr, "http", "", "if set, use streamable HTTP at this address, instead of stdin/stdout")
-	flag.BoolVar(&useStdio, "stdio", true, "use stdio transport")
+	flag.BoolVar(&useStdio, "stdio", true, "use stdio transport (ignored if -http is set)")
 	flag.Parse()
 
 	// Validate required parameters
@@ -159,6 +164,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: -auth must be in format 'user:api_token'")
 		os.Exit(1)
 	}
+
+	// Parse user/token and initialize HTTP clients
+	parts := strings.SplitN(opts.Auth, ":", 2)
+	opts.User, opts.Token = parts[0], parts[1]
+	opts.Client = &http.Client{Timeout: 30 * time.Second}
+	opts.LogsClient = &http.Client{Timeout: 60 * time.Second}
 
 	log.Printf("Using Jenkins URL: %s", opts.URL)
 	log.Printf("Using Jenkins auth for user: %s", strings.Split(opts.Auth, ":")[0])
@@ -208,7 +219,10 @@ func main() {
 	if getJobInputSchema.Properties == nil {
 		getJobInputSchema.Properties = make(map[string]*jsonschema.Schema)
 	}
-	getJobInputSchema.Properties["name"].Description = "Name of the Jenkins job to retrieve"
+	if p, ok := getJobInputSchema.Properties["name"]; ok && p != nil {
+		p.Description = "Name of the Jenkins job to retrieve"
+	}
+	getJobInputSchema.Required = append(getJobInputSchema.Required, "name")
 
 	mcp.AddTool[getJobArgs, any](server, &mcp.Tool{
 		Name:        getJobToolName,
@@ -288,12 +302,21 @@ func main() {
 	if getBuildLogsInputSchema.Properties == nil {
 		getBuildLogsInputSchema.Properties = make(map[string]*jsonschema.Schema)
 	}
-	getBuildLogsInputSchema.Properties["name"].Description = "Name of the Jenkins job"
-	getBuildLogsInputSchema.Properties["build_number"].Description = "Build number to get logs for"
-	getBuildLogsInputSchema.Properties["offset"].Description = "Starting byte offset in the log file (default: 0)"
-	getBuildLogsInputSchema.Properties["offset"].Default = json.RawMessage("0")
-	getBuildLogsInputSchema.Properties["length"].Description = "Maximum number of bytes to retrieve (default: 8192)"
-	getBuildLogsInputSchema.Properties["length"].Default = json.RawMessage("8192")
+	if p, ok := getBuildLogsInputSchema.Properties["name"]; ok && p != nil {
+		p.Description = "Name of the Jenkins job"
+	}
+	if p, ok := getBuildLogsInputSchema.Properties["build_number"]; ok && p != nil {
+		p.Description = "Build number to get logs for"
+	}
+	if p, ok := getBuildLogsInputSchema.Properties["offset"]; ok && p != nil {
+		p.Description = "Starting byte offset in the log file (default: 0)"
+		p.Default = json.RawMessage("0")
+	}
+	if p, ok := getBuildLogsInputSchema.Properties["length"]; ok && p != nil {
+		p.Description = "Maximum number of bytes to retrieve (default: 8192)"
+		p.Default = json.RawMessage("8192")
+	}
+	getBuildLogsInputSchema.Required = append(getBuildLogsInputSchema.Required, "name", "build_number")
 
 	mcp.AddTool[getBuildLogsArgs, any](server, &mcp.Tool{
 		Name:        getBuildLogsToolName,
@@ -353,10 +376,17 @@ func main() {
 	if getBuildLogsSuffixInputSchema.Properties == nil {
 		getBuildLogsSuffixInputSchema.Properties = make(map[string]*jsonschema.Schema)
 	}
-	getBuildLogsSuffixInputSchema.Properties["job_name"].Description = "Name of the Jenkins job"
-	getBuildLogsSuffixInputSchema.Properties["build_number"].Description = "Build number to get logs for"
-	getBuildLogsSuffixInputSchema.Properties["max_length"].Description = "Maximum number of bytes to retrieve from the end of the log (default: 8192)"
-	getBuildLogsSuffixInputSchema.Properties["max_length"].Default = json.RawMessage("8192")
+	if p, ok := getBuildLogsSuffixInputSchema.Properties["job_name"]; ok && p != nil {
+		p.Description = "Name of the Jenkins job"
+	}
+	if p, ok := getBuildLogsSuffixInputSchema.Properties["build_number"]; ok && p != nil {
+		p.Description = "Build number to get logs for"
+	}
+	if p, ok := getBuildLogsSuffixInputSchema.Properties["max_length"]; ok && p != nil {
+		p.Description = "Maximum number of bytes to retrieve from the end of the log (default: 8192)"
+		p.Default = json.RawMessage("8192")
+	}
+	getBuildLogsSuffixInputSchema.Required = append(getBuildLogsSuffixInputSchema.Required, "job_name", "build_number")
 
 	mcp.AddTool[getBuildLogsSuffixArgs, any](server, &mcp.Tool{
 		Name:        getBuildLogsSuffixToolName,
@@ -412,27 +442,47 @@ func main() {
 		if err := http.ListenAndServe(httpAddr, handler); err != nil {
 			log.Fatalf("http server error: %v", err)
 		}
-	} else {
+	} else if useStdio {
+		log.Printf("Starting MCP server over stdio")
 		if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("server error: %v", err)
 		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Error: no transport selected. Use -http or -stdio.")
+		os.Exit(1)
 	}
+}
+
+// buildJobPath builds a Jenkins job path supporting nested folders.
+// Example: "folder1/folder2/jobName" -> "/job/folder1/job/folder2/job/jobName"
+func buildJobPath(jobName string) string {
+	segs := strings.Split(jobName, "/")
+	var b strings.Builder
+	for i, s := range segs {
+		if s == "" {
+			continue
+		}
+		if i > 0 {
+			b.WriteString("/job/")
+		} else {
+			b.WriteString("/job/")
+		}
+		b.WriteString(url.PathEscape(s))
+	}
+	return b.String()
 }
 
 // getBuildLogsSuffix fetches the tail/suffix of build logs from Jenkins API
 func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, maxLength int) (*BuildLogsResponse, error) {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 60 * time.Second, // Longer timeout for log retrieval
-	}
+	client := opts.LogsClient
 
 	// First, get the total log size to calculate the offset for the tail
-	// URL encode the job name to handle special characters and spaces
-	encodedJobName := strings.ReplaceAll(jobName, "/", "%2F")
+	// Build Jenkins job path for nested jobs/folders
+	jobPath := buildJobPath(jobName)
 
 	// Get log size using progressiveText API
-	sizeURL := fmt.Sprintf("%s/job/%s/%d/logText/progressiveText?start=0",
-		strings.TrimRight(opts.URL, "/"), encodedJobName, buildNumber)
+	sizeURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=0",
+		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber)
 
 	// Create request to get log size
 	req, err := http.NewRequestWithContext(ctx, "GET", sizeURL, nil)
@@ -441,8 +491,7 @@ func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName strin
 	}
 
 	// Add basic auth header
-	auth := base64.StdEncoding.EncodeToString([]byte(opts.Auth))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "text/plain")
 
 	// Make the request to get size
@@ -499,8 +548,8 @@ func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName strin
 	}
 
 	// Now get the actual tail logs
-	tailURL := fmt.Sprintf("%s/job/%s/%d/logText/progressiveText?start=%d",
-		strings.TrimRight(opts.URL, "/"), encodedJobName, buildNumber, offset)
+	tailURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=%d",
+		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber, offset)
 
 	// Create request for tail logs
 	tailReq, err := http.NewRequestWithContext(ctx, "GET", tailURL, nil)
@@ -508,7 +557,7 @@ func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName strin
 		return nil, fmt.Errorf("failed to create tail request: %w", err)
 	}
 
-	tailReq.Header.Set("Authorization", "Basic "+auth)
+	tailReq.SetBasicAuth(opts.User, opts.Token)
 	tailReq.Header.Set("Accept", "text/plain")
 
 	// Make the request for tail logs
@@ -553,18 +602,15 @@ func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName strin
 
 // getBuildLogs fetches build logs from Jenkins API with pagination support
 func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, offset, length int) (*BuildLogsResponse, error) {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 60 * time.Second, // Longer timeout for log retrieval
-	}
+	client := opts.LogsClient
 
-	// URL encode the job name to handle special characters and spaces
-	encodedJobName := strings.ReplaceAll(jobName, "/", "%2F")
+	// Build Jenkins job path for nested jobs/folders
+	jobPath := buildJobPath(jobName)
 
 	// Build the API URL for build logs with range parameters
 	// Jenkins supports HTTP Range headers for log pagination
-	apiURL := fmt.Sprintf("%s/job/%s/%d/logText/progressiveText?start=%d",
-		strings.TrimRight(opts.URL, "/"), encodedJobName, buildNumber, offset)
+	apiURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=%d",
+		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber, offset)
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -573,8 +619,7 @@ func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, bui
 	}
 
 	// Add basic auth header
-	auth := base64.StdEncoding.EncodeToString([]byte(opts.Auth))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "text/plain")
 
 	// Make the request
@@ -638,16 +683,13 @@ func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, bui
 
 // getJenkinsJob fetches a specific job from Jenkins API by name
 func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*JenkinsJob, error) {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := opts.Client
 
-	// URL encode the job name to handle special characters and spaces
-	encodedJobName := strings.ReplaceAll(jobName, "/", "%2F")
+	// Build Jenkins job path for nested jobs/folders
+	jobPath := buildJobPath(jobName)
 
 	// Build the API URL for the specific job with expanded parameter information
-	apiURL := strings.TrimRight(opts.URL, "/") + "/job/" + encodedJobName + "/api/json?tree=name,url,color,buildable,description,lastBuild[number,url],property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]"
+	apiURL := strings.TrimRight(opts.URL, "/") + jobPath + "/api/json?tree=name,url,color,buildable,description,lastBuild[number,url],property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]"
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -656,8 +698,7 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 	}
 
 	// Add basic auth header
-	auth := base64.StdEncoding.EncodeToString([]byte(opts.Auth))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "application/json")
 
 	// Make the request
@@ -735,7 +776,7 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 
 	// If there's a last build, fetch its details
 	if jobData.LastBuild != nil {
-		build, err := getBuildDetails(ctx, client, opts.Auth, jobData.LastBuild.URL)
+		build, err := getBuildDetails(ctx, opts, jobData.LastBuild.URL)
 		if err != nil {
 			log.Printf("Warning: failed to get build details for %s: %v", jobData.Name, err)
 			// Still include the job but without detailed build info
@@ -753,10 +794,7 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 
 // getJenkinsJobs fetches jobs from Jenkins API
 func getJenkinsJobs(ctx context.Context, opts *JenkinsOptions) ([]JenkinsJob, error) {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := opts.Client
 
 	// Build the API URL
 	apiURL := strings.TrimRight(opts.URL, "/") + "/api/json?tree=jobs[name,url,color,buildable,description,lastBuild[number,url]]"
@@ -768,8 +806,7 @@ func getJenkinsJobs(ctx context.Context, opts *JenkinsOptions) ([]JenkinsJob, er
 	}
 
 	// Add basic auth header
-	auth := base64.StdEncoding.EncodeToString([]byte(opts.Auth))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "application/json")
 
 	// Make the request
@@ -793,38 +830,60 @@ func getJenkinsJobs(ctx context.Context, opts *JenkinsOptions) ([]JenkinsJob, er
 
 	// Convert to our format
 	jobs := make([]JenkinsJob, len(apiResp.Jobs))
+	type workItem struct {
+		idx  int
+		url  string
+		name string
+	}
+	var work []workItem
+
 	for i, job := range apiResp.Jobs {
-		jenkinsJob := JenkinsJob{
+		jobs[i] = JenkinsJob{
 			Name:        job.Name,
 			URL:         job.URL,
 			Color:       job.Color,
 			Buildable:   job.Buildable,
 			Description: job.Description,
 		}
-
-		// If there's a last build, fetch its details
 		if job.LastBuild != nil {
-			build, err := getBuildDetails(ctx, client, opts.Auth, job.LastBuild.URL)
-			if err != nil {
-				log.Printf("Warning: failed to get build details for %s: %v", job.Name, err)
-				// Still include the job but without detailed build info
-				jenkinsJob.LastBuild = &Build{
-					Number: job.LastBuild.Number,
-					URL:    job.LastBuild.URL,
-				}
-			} else {
-				jenkinsJob.LastBuild = build
-			}
+			jobs[i].LastBuild = &Build{Number: job.LastBuild.Number, URL: job.LastBuild.URL}
+			work = append(work, workItem{idx: i, url: job.LastBuild.URL, name: job.Name})
 		}
+	}
 
-		jobs[i] = jenkinsJob
+	if len(work) > 0 {
+		workers := 6
+		if len(work) < workers {
+			workers = len(work)
+		}
+		ch := make(chan workItem)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for it := range ch {
+					build, err := getBuildDetails(ctx, opts, it.url)
+					if err != nil {
+						log.Printf("Warning: failed to get build details for %s: %v", it.name, err)
+						continue
+					}
+					jobs[it.idx].LastBuild = build
+				}
+			}()
+		}
+		for _, it := range work {
+			ch <- it
+		}
+		close(ch)
+		wg.Wait()
 	}
 
 	return jobs, nil
 }
 
 // getBuildDetails fetches detailed information about a specific build
-func getBuildDetails(ctx context.Context, client *http.Client, auth, buildURL string) (*Build, error) {
+func getBuildDetails(ctx context.Context, opts *JenkinsOptions, buildURL string) (*Build, error) {
 	// Add /api/json to the build URL if not already present
 	apiURL := strings.TrimRight(buildURL, "/") + "/api/json"
 
@@ -834,11 +893,10 @@ func getBuildDetails(ctx context.Context, client *http.Client, auth, buildURL st
 	}
 
 	// Add basic auth header
-	authHeader := base64.StdEncoding.EncodeToString([]byte(auth))
-	req.Header.Set("Authorization", "Basic "+authHeader)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := opts.Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -873,10 +931,7 @@ func getBuildDetails(ctx context.Context, client *http.Client, auth, buildURL st
 
 // getRunningBuilds fetches currently running builds from Jenkins API
 func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild, error) {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := opts.Client
 
 	// Build the API URL for computer information (includes executors)
 	apiURL := strings.TrimRight(opts.URL, "/") + "/computer/api/json?tree=computer[displayName,executors[currentExecutable[url,fullDisplayName,timestamp],idle,likelyStuck,progress]]"
@@ -888,8 +943,7 @@ func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild
 	}
 
 	// Add basic auth header
-	auth := base64.StdEncoding.EncodeToString([]byte(opts.Auth))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.SetBasicAuth(opts.User, opts.Token)
 	req.Header.Set("Accept", "application/json")
 
 	// Make the request
@@ -940,8 +994,13 @@ func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild
 			executable := executor.CurrentExecutable
 
 			// Parse job name and build number from the full display name
-			// Format is typically "jobName #buildNumber"
+			// Format is typically "jobName #buildNumber"; fallback to URL if needed
 			jobName, buildNumber := parseJobNameAndBuildNumber(executable.FullDisplayName)
+			if buildNumber == 0 {
+				if n := parseBuildNumberFromURL(executable.URL); n > 0 {
+					buildNumber = n
+				}
+			}
 
 			runningBuild := RunningBuild{
 				JobName:     jobName,
@@ -977,4 +1036,24 @@ func parseJobNameAndBuildNumber(fullDisplayName string) (string, int) {
 
 	// If parsing fails, return the full name as job name and 0 as build number
 	return fullDisplayName, 0
+}
+
+// parseBuildNumberFromURL extracts the trailing numeric segment from a Jenkins build URL.
+func parseBuildNumberFromURL(u string) int {
+	if i := strings.IndexByte(u, '?'); i >= 0 {
+		u = u[:i]
+	}
+	if i := strings.IndexByte(u, '#'); i >= 0 {
+		u = u[:i]
+	}
+	parts := strings.Split(strings.TrimSuffix(u, "/"), "/")
+	if len(parts) == 0 {
+		return 0
+	}
+	last := parts[len(parts)-1]
+	n, err := strconv.Atoi(last)
+	if err != nil {
+		return 0
+	}
+	return n
 }

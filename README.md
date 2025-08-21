@@ -139,7 +139,7 @@ Examples:
 - 30-second timeout for API calls, 60-second timeout for log retrieval
 - Graceful error handling for individual build details and missing jobs/builds
 - Parses job names and build numbers from executor information
-- URL encodes job names to handle special characters and spaces
+- Supports nested jobs/folders via Jenkins path convention `/job/<seg>/job/<seg>/...` and proper URL escaping
 - Supports log pagination with offset and length parameters
 - Detects running builds and provides hasMore flag for pagination
 - Optimized tail log retrieval for quick failure analysis
@@ -148,7 +148,11 @@ Examples:
 - Input validation: enforces required URL and auth parameters
 - Auth format: must be "user:api_token" format
 - Errors: returned as tool results with `isError=true` for LLM visibility
-- Build details are fetched asynchronously for better performance
+- Build details are fetched concurrently for better performance
+
+**Transport**
+- `-http <addr>` starts Streamable HTTP; otherwise `-stdio` runs by default.
+- If `-stdio=false` and no `-http` is provided, the server exits with an error.
 
 **TODO**
 - Add more Jenkins tools (build job, get build status, get build logs, etc.)
