@@ -21,13 +21,13 @@ import (
 )
 
 const (
-	getJobsToolName             = "get_jobs"
-	getJobToolName              = "get_job"
-	getRunningBuildsToolName    = "get_running_builds"
-	getBuildLogsToolName        = "get_build_logs"
-	getBuildLogsSuffixToolName  = "get_build_logs_suffix"
-	startJobToolName            = "start_job"
-	waitForRunningBuildToolName = "wait_for_running_build"
+	getJobsToolName             = "jenkins_get_jobs"
+	getJobToolName              = "jenkins_get_job"
+	getRunningBuildsToolName    = "jenkins_get_running_builds"
+	getBuildLogsToolName        = "jenkins_get_build_logs"
+	getBuildLogTailToolName     = "jenkins_get_build_log_tail"
+	startJobToolName            = "jenkins_start_job"
+	waitForRunningBuildToolName = "jenkins_wait_for_running_build"
 )
 
 // getJobsArgs are the tool arguments for get_jobs.
@@ -53,8 +53,8 @@ type getBuildLogsArgs struct {
 	Length      int    `json:"length,omitempty"`
 }
 
-// getBuildLogsSuffixArgs are the tool arguments for get_build_logs_suffix.
-type getBuildLogsSuffixArgs struct {
+// getBuildLogTailArgs are the tool arguments for get_build_log_tail.
+type getBuildLogTailArgs struct {
 	JobName     string `json:"job_name"`
 	BuildNumber int    `json:"build_number"`
 	MaxLength   int    `json:"max_length,omitempty"`
@@ -402,30 +402,30 @@ func main() {
 		}, nil
 	})
 
-	// Build input schema for get_build_logs_suffix tool
-	getBuildLogsSuffixInputSchema, err := jsonschema.For[getBuildLogsSuffixArgs](nil)
+	// Build input schema for get_build_log_tail tool
+	getBuildLogTailInputSchema, err := jsonschema.For[getBuildLogTailArgs](nil)
 	if err != nil {
-		log.Fatalf("build get_build_logs_suffix input schema: %v", err)
+		log.Fatalf("build get_build_log_tail input schema: %v", err)
 	}
-	if getBuildLogsSuffixInputSchema.Properties == nil {
-		getBuildLogsSuffixInputSchema.Properties = make(map[string]*jsonschema.Schema)
+	if getBuildLogTailInputSchema.Properties == nil {
+		getBuildLogTailInputSchema.Properties = make(map[string]*jsonschema.Schema)
 	}
-	if p, ok := getBuildLogsSuffixInputSchema.Properties["job_name"]; ok && p != nil {
+	if p, ok := getBuildLogTailInputSchema.Properties["job_name"]; ok && p != nil {
 		p.Description = "Name of the Jenkins job"
 	}
-	if p, ok := getBuildLogsSuffixInputSchema.Properties["build_number"]; ok && p != nil {
+	if p, ok := getBuildLogTailInputSchema.Properties["build_number"]; ok && p != nil {
 		p.Description = "Build number to get logs for"
 	}
-	if p, ok := getBuildLogsSuffixInputSchema.Properties["max_length"]; ok && p != nil {
+	if p, ok := getBuildLogTailInputSchema.Properties["max_length"]; ok && p != nil {
 		p.Description = "Maximum number of bytes to retrieve from the end of the log (default: 8192)"
 		p.Default = json.RawMessage("8192")
 	}
 
-	mcp.AddTool[getBuildLogsSuffixArgs, any](server, &mcp.Tool{
-		Name:        getBuildLogsSuffixToolName,
-		Description: "Get the tail/suffix of build logs for a specific Jenkins job and build number - useful for seeing why builds failed",
-		InputSchema: getBuildLogsSuffixInputSchema,
-	}, func(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[getBuildLogsSuffixArgs]]) (*mcp.CallToolResultFor[any], error) {
+	mcp.AddTool[getBuildLogTailArgs, any](server, &mcp.Tool{
+		Name:        getBuildLogTailToolName,
+		Description: "Get the tail of build logs for a specific Jenkins job and build number - useful for seeing why builds failed",
+		InputSchema: getBuildLogTailInputSchema,
+	}, func(ctx context.Context, req *mcp.ServerRequest[*mcp.CallToolParamsFor[getBuildLogTailArgs]]) (*mcp.CallToolResultFor[any], error) {
 		args := req.Params.Arguments
 		if strings.TrimSpace(args.JobName) == "" {
 			return &mcp.CallToolResultFor[any]{
@@ -445,8 +445,8 @@ func main() {
 			args.MaxLength = 8192
 		}
 
-		// Fetch build logs suffix from Jenkins API
-		logsResponse, err := getBuildLogsSuffix(ctx, opts, args.JobName, args.BuildNumber, args.MaxLength)
+		// Fetch build log tail from Jenkins API
+		logsResponse, err := getBuildLogTail(ctx, opts, args.JobName, args.BuildNumber, args.MaxLength)
 		if err != nil {
 			return &mcp.CallToolResultFor[any]{
 				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
@@ -765,8 +765,8 @@ func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params 
 	}
 }
 
-// getBuildLogsSuffix fetches the tail/suffix of build logs from Jenkins API
-func getBuildLogsSuffix(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, maxLength int) (*BuildLogsResponse, error) {
+// getBuildLogTail fetches the tail of build logs from Jenkins API
+func getBuildLogTail(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, maxLength int) (*BuildLogsResponse, error) {
 	client := opts.LogsClient
 
 	// First, get the total log size to calculate the offset for the tail

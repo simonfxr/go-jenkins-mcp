@@ -5,22 +5,22 @@
 - Transport: stdio (newline-delimited JSON) via `mcp-go-sdk`.
 
 **Features**
-- Tool: `get_jobs`
+- Tool: `jenkins_get_jobs`
   - Description: Get list of Jenkins jobs with their current status
   - Arguments: None
   - Returns: JSON array of Jenkins jobs with detailed information
 
-- Tool: `get_job`
+- Tool: `jenkins_get_job`
   - Description: Get detailed information about a specific Jenkins job by name
   - Arguments: `name` (required) - Name of the Jenkins job
   - Returns: JSON object with detailed job information
 
-- Tool: `get_running_builds`
+- Tool: `jenkins_get_running_builds`
   - Description: Get list of currently running Jenkins builds
   - Arguments: None
   - Returns: JSON array of running builds with execution details
 
-- Tool: `get_build_logs`
+- Tool: `jenkins_get_build_logs`
   - Description: Get build logs for a specific Jenkins job and build number with pagination support
   - Arguments: 
     - `name` (required) - Name of the Jenkins job
@@ -29,15 +29,15 @@
     - `length` (optional, default: 8192) - Maximum number of bytes to retrieve
   - Returns: JSON object with log content and pagination information
 
-- Tool: `get_build_logs_suffix`
-  - Description: Get the tail/suffix of build logs - useful for seeing why builds failed
+- Tool: `jenkins_get_build_log_tail`
+  - Description: Get the tail of build logs - useful for seeing why builds failed
   - Arguments:
     - `job_name` (required) - Name of the Jenkins job
     - `build_number` (required) - Build number to get logs for
     - `max_length` (optional, default: 8192) - Maximum number of bytes to retrieve from the end
   - Returns: JSON object with tail log content and metadata
 
-- Tool: `start_job`
+- Tool: `jenkins_start_job`
   - Description: Trigger a Jenkins job build with optional parameters and wait options
   - Arguments:
     - `job_name` (required) - Name/path of the Jenkins job (supports folders)
@@ -45,7 +45,7 @@
     - `wait` (optional, default: `none`) - One of `none`, `queued`, `started`
   - Returns: JSON with `jobName`, `queueUrl` (if available), and for `wait=started`, `buildUrl` and `buildNumber`
 
-- Tool: `wait_for_running_build`
+- Tool: `jenkins_wait_for_running_build`
   - Description: Wait for a running Jenkins build to complete or timeout
   - Arguments:
     - `job_name` (required) - Name of the Jenkins job
@@ -54,7 +54,7 @@
   - Returns: JSON object with build completion status and timing information
 
 **Job Format**
-Each job returned by `get_jobs` includes:
+Each job returned by `jenkins_get_jobs` includes:
 ```json
 {
   "name": "job-name",
@@ -89,10 +89,10 @@ Each job returned by `get_jobs` includes:
 }
 ```
 
-Note: The `get_job` tool returns individual jobs with full parameter information, while `get_jobs` returns the job list without parameters for performance.
+Note: The `jenkins_get_job` tool returns individual jobs with full parameter information, while `jenkins_get_jobs` returns the job list without parameters for performance.
 
 **Running Build Format**
-Each running build returned by `get_running_builds` includes:
+Each running build returned by `jenkins_get_running_builds` includes:
 ```json
 {
   "jobName": "job-name",
@@ -106,7 +106,7 @@ Each running build returned by `get_running_builds` includes:
 ```
 
 **Build Logs Format**
-Build logs returned by `get_build_logs` include:
+Build logs returned by `jenkins_get_build_logs` include:
 ```json
 {
   "jobName": "job-name",
@@ -120,7 +120,7 @@ Build logs returned by `get_build_logs` include:
 ```
 
 **Wait for Build Format**
-Build wait results returned by `wait_for_running_build` include:
+Build wait results returned by `jenkins_wait_for_running_build` include:
 ```json
 {
   "jobName": "job-name",
