@@ -13,19 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-)
-
-const (
-	getJobsToolName             = "jenkins_get_jobs"
-	getJobToolName              = "jenkins_get_job"
-	getRunningBuildsToolName    = "jenkins_get_running_builds"
-	getBuildLogsToolName        = "jenkins_get_build_logs"
-	getBuildLogTailToolName     = "jenkins_get_build_log_tail"
-	startJobToolName            = "jenkins_start_job"
-	waitForRunningBuildToolName = "jenkins_wait_for_running_build"
 )
 
 // getJobsArgs are the tool arguments for get_jobs.
@@ -46,7 +37,7 @@ type getRunningBuildsArgs struct {
 // getBuildLogsArgs are the tool arguments for get_build_logs.
 type getBuildLogsArgs struct {
 	Name        string `json:"job_name" jsonschema:"Name of the Jenkins job"`
-	BuildNumber int    `json:"build_number" jsonschema:"Build number to get logs for"`
+	BuildNumber int    `json:"build_number" jsonschema:"Build number"`
 	Offset      int    `json:"offset,omitempty" jsonschema:"Starting byte offset in the log file (default: 0)" default:"0"`
 	Length      int    `json:"length,omitempty" jsonschema:"Maximum number of bytes to retrieve (default: 8192)" default:"8192"`
 }
@@ -54,7 +45,7 @@ type getBuildLogsArgs struct {
 // getBuildLogTailArgs are the tool arguments for get_build_log_tail.
 type getBuildLogTailArgs struct {
 	JobName     string `json:"job_name" jsonschema:"Name of the Jenkins job"`
-	BuildNumber int    `json:"build_number" jsonschema:"Build number to get logs for"`
+	BuildNumber int    `json:"build_number" jsonschema:"Build number"`
 	MaxLength   int    `json:"max_length,omitempty" jsonschema:"Maximum bytes from end of log to retrieve (default: 8192)" default:"8192"`
 }
 
@@ -62,13 +53,12 @@ type getBuildLogTailArgs struct {
 type startJobArgs struct {
 	JobName    string         `json:"job_name" jsonschema:"Name/path of the Jenkins job (supports folders)"`
 	Parameters map[string]any `json:"parameters,omitempty" jsonschema:"Optional key/value map of build parameters"`
-	Wait       string         `json:"wait,omitempty" jsonschema:"When to return: 'none', 'queued' (default), or 'started'" default:"queued"`
 }
 
 // waitForRunningBuildArgs are the tool arguments for wait_for_running_build.
 type waitForRunningBuildArgs struct {
 	JobName        string `json:"job_name" jsonschema:"Name of the Jenkins job"`
-	BuildNumber    int    `json:"build_number" jsonschema:"Build number to wait for"`
+	BuildNumber    int    `json:"build_number" jsonschema:"Build number"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Maximum time to wait in seconds (default: 600)" default:"600"`
 }
 
@@ -176,91 +166,46 @@ type JenkinsAPIResponse struct {
 	} `json:"jobs"`
 }
 
-func main() {
-	// Prepare options and bind flags directly to fields.
-	opts := &JenkinsOptions{}
-	var (
-		httpAddr string
-		useStdio bool
-	)
-
-	flag.StringVar(&opts.URL, "url", "", "Jenkins URL (required)")
-	flag.StringVar(&opts.Auth, "auth", "", "Jenkins authentication in format 'user:api_token' (required)")
-	flag.StringVar(&httpAddr, "http", "", "if set, use streamable HTTP at this address, instead of stdin/stdout")
-	flag.BoolVar(&useStdio, "stdio", true, "use stdio transport (ignored if -http is set)")
-	flag.Parse()
-
-	// Validate required parameters
-	if opts.URL == "" {
-		fmt.Fprintln(os.Stderr, "Error: -url parameter is required")
-		os.Exit(1)
-	}
-	if opts.Auth == "" {
-		fmt.Fprintln(os.Stderr, "Error: -auth parameter is required")
-		os.Exit(1)
-	}
-
-	// Validate auth format
-	if !strings.Contains(opts.Auth, ":") {
-		fmt.Fprintln(os.Stderr, "Error: -auth must be in format 'user:api_token'")
-		os.Exit(1)
-	}
-
-	// Parse user/token and initialize HTTP clients
-	parts := strings.SplitN(opts.Auth, ":", 2)
-	opts.User, opts.Token = parts[0], parts[1]
-	opts.Client = &http.Client{Timeout: 30 * time.Second}
-	opts.LogsClient = &http.Client{Timeout: 60 * time.Second}
-
-	log.Printf("Using Jenkins URL: %s", opts.URL)
-	log.Printf("Using Jenkins auth for user: %s", strings.Split(opts.Auth, ":")[0])
-
-	// Build MCP server
-	server := mcp.NewServer(&mcp.Implementation{Name: "jenkins-mcp-go", Version: "0.1.0"}, nil)
-
-	// get_jobs
-	AddTool(server, &mcp.Tool{
-		Name:        getJobsToolName,
+func (opts *JenkinsOptions) addTools(s *mcp.Server) {
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_get_jobs",
 		Description: "Get list of Jenkins jobs with their current status"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args getJobsArgs) (*mcp.CallToolResult, JenkinsJobs, error) {
-			jobs, err := getJenkinsJobs(ctx, opts)
+			jobs, err := opts.getJenkinsJobs(ctx)
 			if err != nil {
 				return nil, JenkinsJobs{}, err
 			}
 			return nil, JenkinsJobs{jobs}, nil
 		})
 
-	// get_job
-	AddTool(server, &mcp.Tool{
-		Name:        getJobToolName,
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_get_job",
 		Description: "Get detailed information about a specific Jenkins job by name"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args getJobArgs) (*mcp.CallToolResult, JenkinsJob, error) {
 			if strings.TrimSpace(args.Name) == "" {
 				return nil, JenkinsJob{}, fmt.Errorf("missing required argument: name")
 			}
-			job, err := getJenkinsJob(ctx, opts, args.Name)
+			job, err := opts.getJenkinsJob(ctx, args.Name)
 			if err != nil {
 				return nil, JenkinsJob{}, err
 			}
-			return StructuredResult(*job)
+			return structuredResult(*job)
 		})
 
-	// get_running_builds
-	AddTool(server, &mcp.Tool{
-		Name:        getRunningBuildsToolName,
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_get_running_builds",
 		Description: "Get list of currently running Jenkins builds"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args getRunningBuildsArgs) (*mcp.CallToolResult, RunningBuilds, error) {
-			runningBuilds, err := getRunningBuilds(ctx, opts)
+			runningBuilds, err := opts.getRunningBuilds(ctx)
 			if err != nil {
 				return nil, RunningBuilds{}, err
 			}
-			return StructuredResult(RunningBuilds{runningBuilds})
+			return structuredResult(RunningBuilds{runningBuilds})
 		})
 
-	// get_build_logs
-	AddTool(server, &mcp.Tool{
-		Name:        getBuildLogsToolName,
-		Description: "Get build logs for a specific Jenkins job and build number with pagination support"},
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_get_build_logs",
+		Description: "Get build logs for a specific Jenkins job and build number starting at given offset"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogsArgs) (*mcp.CallToolResult, any, error) {
 			if strings.TrimSpace(args.Name) == "" {
 				return nil, nil, fmt.Errorf("missing required argument: name")
@@ -274,7 +219,7 @@ func main() {
 			if args.Offset < 0 {
 				args.Offset = 0
 			}
-			logsResponse, err := getBuildLogs(ctx, opts, args.Name, args.BuildNumber, args.Offset, args.Length)
+			logsResponse, err := opts.getBuildLogs(ctx, args.Name, args.BuildNumber, args.Offset, args.Length)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -283,10 +228,9 @@ func main() {
 			return &res, nil, nil
 		})
 
-	// get_build_log_tail
-	AddTool(server, &mcp.Tool{
-		Name:        getBuildLogTailToolName,
-		Description: "Get the tail of build logs for a specific Jenkins job and build number - useful for seeing why builds failed"},
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_get_build_log_tail",
+		Description: "Get the tail of build logs for a specific Jenkins job and build number"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogTailArgs) (*mcp.CallToolResult, any, error) {
 			if strings.TrimSpace(args.JobName) == "" {
 				return nil, nil, fmt.Errorf("missing required argument: job_name")
@@ -297,7 +241,7 @@ func main() {
 			if args.MaxLength <= 0 {
 				args.MaxLength = 8192
 			}
-			logsResponse, err := getBuildLogTail(ctx, opts, args.JobName, args.BuildNumber, args.MaxLength)
+			logsResponse, err := opts.getBuildLogTail(ctx, args.JobName, args.BuildNumber, args.MaxLength)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -306,32 +250,23 @@ func main() {
 			return &res, nil, nil
 		})
 
-	// start_job
-	AddTool(server, &mcp.Tool{
-		Name:        startJobToolName,
-		Description: "Trigger a Jenkins job build with optional parameters and wait behavior"},
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_start_job",
+		Description: "Trigger a Jenkins job build with optional parameters"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args startJobArgs) (*mcp.CallToolResult, StartJobResponse, error) {
 			if strings.TrimSpace(args.JobName) == "" {
 				return nil, StartJobResponse{}, fmt.Errorf("missing required argument: job_name")
 			}
-			if args.Wait == "" {
-				args.Wait = "queued"
-			}
-			switch args.Wait {
-			case "none", "queued", "started":
-			default:
-				return nil, StartJobResponse{}, fmt.Errorf("invalid wait value: expected 'none', 'queued', or 'started'")
-			}
-			resObj, err := startJob(ctx, opts, args.JobName, args.Parameters, args.Wait)
+			// Hardcode the behavior to 'started' (wait until build starts)
+			resObj, err := opts.startJob(ctx, args.JobName, args.Parameters)
 			if err != nil {
 				return nil, StartJobResponse{}, err
 			}
-			return StructuredResult(*resObj)
+			return structuredResult(*resObj)
 		})
 
-	// wait_for_running_build
-	AddTool(server, &mcp.Tool{
-		Name:        waitForRunningBuildToolName,
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_wait_for_running_build",
 		Description: "Wait for a running Jenkins build to complete or timeout"},
 		func(ctx context.Context, req *mcp.CallToolRequest, args waitForRunningBuildArgs) (*mcp.CallToolResult, WaitForRunningBuildResponse, error) {
 			if strings.TrimSpace(args.JobName) == "" {
@@ -343,30 +278,12 @@ func main() {
 			if args.TimeoutSeconds <= 0 {
 				args.TimeoutSeconds = 600
 			}
-			resObj, err := waitForRunningBuild(ctx, opts, args.JobName, args.BuildNumber, args.TimeoutSeconds)
+			resObj, err := opts.waitForRunningBuild(ctx, args.JobName, args.BuildNumber, args.TimeoutSeconds)
 			if err != nil {
 				return nil, WaitForRunningBuildResponse{}, err
 			}
-			return StructuredResult(*resObj)
+			return structuredResult(*resObj)
 		})
-
-	// Choose transport
-	if httpAddr != "" {
-		handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server }, nil)
-		log.Printf("Starting MCP HTTP server on %s", httpAddr)
-		if err := http.ListenAndServe(httpAddr, handler); err != nil {
-			log.Fatalf("http server error: %v", err)
-		}
-	} else if useStdio {
-		log.Printf("Starting MCP server over stdio")
-		t := &mcp.LoggingTransport{Transport: &mcp.StdioTransport{}, Writer: os.Stderr}
-		if err := server.Run(context.Background(), t); err != nil {
-			log.Printf("server error: %v", err)
-		}
-	} else {
-		fmt.Fprintln(os.Stderr, "Error: no transport selected. Use -http or -stdio.")
-		os.Exit(1)
-	}
 }
 
 // buildJobPath builds a Jenkins job path supporting nested folders.
@@ -384,17 +301,54 @@ func buildJobPath(jobName string) string {
 	return b.String()
 }
 
-// getCrumb fetches Jenkins CSRF crumb and header field name.
-func getCrumb(ctx context.Context, opts *JenkinsOptions) (field, crumb string, ok bool, err error) {
-	apiURL := strings.TrimRight(opts.URL, "/") + "/crumbIssuer/api/json"
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+// callJenkins builds the URL (absolute or relative to base), attaches auth and headers, and executes the request.
+// If apiPath starts with http:// or https://, it is treated as an absolute URL; otherwise it is appended to opts.URL.
+// Default Accept header is application/json unless overridden via headers.
+func (opts *JenkinsOptions) callJenkins(
+	ctx context.Context,
+	client *http.Client,
+	method string,
+	apiPath string,
+	body io.Reader,
+	headers map[string]string,
+) (*http.Response, error) {
+	if client == nil {
+		client = opts.Client
+	}
+	base := strings.TrimRight(opts.URL, "/")
+	var fullURL string
+	if strings.HasPrefix(apiPath, "http://") || strings.HasPrefix(apiPath, "https://") {
+		fullURL = apiPath
+	} else {
+		if strings.HasPrefix(apiPath, "/") {
+			fullURL = base + apiPath
+		} else if apiPath == "" {
+			fullURL = base
+		} else {
+			fullURL = base + "/" + apiPath
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
-		return "", "", false, err
+		return nil, err
 	}
 	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "application/json")
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	if _, ok := headers["Accept"]; !ok {
+		req.Header.Set("Accept", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return client.Do(req)
+}
 
-	resp, err := opts.Client.Do(req)
+// getCrumb fetches Jenkins CSRF crumb and header field name.
+func (opts *JenkinsOptions) getCrumb(ctx context.Context) (field, crumb string, ok bool, err error) {
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, "/crumbIssuer/api/json", nil, nil)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -421,12 +375,11 @@ func getCrumb(ctx context.Context, opts *JenkinsOptions) (field, crumb string, o
 }
 
 // startJob triggers a Jenkins job, optionally with parameters, and optionally waits.
-func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params map[string]any, wait string) (*StartJobResponse, error) {
+func (opts *JenkinsOptions) startJob(ctx context.Context, jobName string, params map[string]any) (*StartJobResponse, error) {
 	jobPath := buildJobPath(jobName)
-	base := strings.TrimRight(opts.URL, "/")
 
 	// Always use buildWithParameters endpoint as it works for both parameterized and non-parameterized jobs
-	endpoint := base + jobPath + "/buildWithParameters"
+	apiPath := jobPath + "/buildWithParameters"
 
 	form := url.Values{}
 	for k, v := range params {
@@ -436,17 +389,11 @@ func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params 
 
 	body := strings.NewReader(form.Encode())
 
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create build request: %w", err)
+	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	if f, c, ok, _ := opts.getCrumb(ctx); ok {
+		headers[f] = c
 	}
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if f, c, ok, _ := getCrumb(ctx, opts); ok {
-		req.Header.Set(f, c)
-	}
-
-	resp, err := opts.Client.Do(req)
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodPost, apiPath, body, headers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start build: %w", err)
 	}
@@ -464,78 +411,61 @@ func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params 
 		result.QueueURL = queueURL
 	}
 
-	switch wait {
-	case "none":
-		return result, nil
-	case "queued":
-		// We already have queue URL (if provided). Return now.
-		return result, nil
-	case "started":
-		if queueURL == "" {
-			return result, nil // cannot wait without queue URL
-		}
-		// Poll queue item until executable is assigned
-		// Use a reasonable default timeout
-		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		defer cancel()
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-waitCtx.Done():
-				return result, nil
-			case <-ticker.C:
-				qreq, err := http.NewRequestWithContext(waitCtx, "GET", strings.TrimRight(queueURL, "/")+"/api/json", nil)
-				if err != nil {
-					return result, nil
+	// Hardcoded 'started' behavior: wait until the queue item gets an executable
+	if queueURL == "" {
+		return result, nil // cannot wait without queue URL
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return result, nil
+		case <-ticker.C:
+			qresp, err := opts.callJenkins(waitCtx, opts.Client, http.MethodGet, strings.TrimRight(queueURL, "/")+"/api/json", nil, nil)
+			if err != nil {
+				continue
+			}
+			func() {
+				defer qresp.Body.Close()
+				if qresp.StatusCode != http.StatusOK {
+					return
 				}
-				qreq.SetBasicAuth(opts.User, opts.Token)
-				qreq.Header.Set("Accept", "application/json")
-				qresp, err := opts.Client.Do(qreq)
-				if err != nil {
-					continue
+				var q struct {
+					Cancelled  bool `json:"cancelled"`
+					Executable *struct {
+						Number int    `json:"number"`
+						URL    string `json:"url"`
+					} `json:"executable"`
 				}
-				func() {
-					defer qresp.Body.Close()
-					if qresp.StatusCode != http.StatusOK {
-						return
-					}
-					var q struct {
-						Cancelled  bool `json:"cancelled"`
-						Executable *struct {
-							Number int    `json:"number"`
-							URL    string `json:"url"`
-						} `json:"executable"`
-					}
-					if err := json.NewDecoder(qresp.Body).Decode(&q); err != nil {
-						return
-					}
-					if q.Cancelled {
-						// leave result without build info
-						return
-					}
-					if q.Executable != nil {
-						result.BuildNumber = q.Executable.Number
-						result.BuildURL = q.Executable.URL
-						// done
-						cancel()
-					}
-				}()
-			}
-			if waitCtx.Err() != nil {
-				return result, nil
-			}
-			if result.BuildNumber > 0 || result.BuildURL != "" {
-				return result, nil
-			}
+				if err := json.NewDecoder(qresp.Body).Decode(&q); err != nil {
+					return
+				}
+				if q.Cancelled {
+					// leave result without build info
+					return
+				}
+				if q.Executable != nil {
+					result.BuildNumber = q.Executable.Number
+					result.BuildURL = q.Executable.URL
+					// done
+					cancel()
+				}
+			}()
 		}
-	default:
-		return result, nil
+		if waitCtx.Err() != nil {
+			return result, nil
+		}
+		if result.BuildNumber > 0 || result.BuildURL != "" {
+			return result, nil
+		}
 	}
 }
 
 // getBuildLogTail fetches the tail of build logs from Jenkins API
-func getBuildLogTail(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, maxLength int) (*BuildLogsResponse, error) {
+func (opts *JenkinsOptions) getBuildLogTail(ctx context.Context, jobName string, buildNumber, maxLength int) (*BuildLogsResponse, error) {
 	client := opts.LogsClient
 
 	// First, get the total log size to calculate the offset for the tail
@@ -543,21 +473,8 @@ func getBuildLogTail(ctx context.Context, opts *JenkinsOptions, jobName string, 
 	jobPath := buildJobPath(jobName)
 
 	// Get log size using progressiveText API
-	sizeURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=0",
-		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber)
-
-	// Create request to get log size
-	req, err := http.NewRequestWithContext(ctx, "GET", sizeURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create size request: %w", err)
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "text/plain")
-
-	// Make the request to get size
-	resp, err := client.Do(req)
+	sizePath := fmt.Sprintf("%s/%d/logText/progressiveText?start=0", jobPath, buildNumber)
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, sizePath, nil, map[string]string{"Accept": "text/plain"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to make size request: %w", err)
 	}
@@ -610,20 +527,8 @@ func getBuildLogTail(ctx context.Context, opts *JenkinsOptions, jobName string, 
 	}
 
 	// Now get the actual tail logs
-	tailURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=%d",
-		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber, offset)
-
-	// Create request for tail logs
-	tailReq, err := http.NewRequestWithContext(ctx, "GET", tailURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tail request: %w", err)
-	}
-
-	tailReq.SetBasicAuth(opts.User, opts.Token)
-	tailReq.Header.Set("Accept", "text/plain")
-
-	// Make the request for tail logs
-	tailResp, err := client.Do(tailReq)
+	tailPath := fmt.Sprintf("%s/%d/logText/progressiveText?start=%d", jobPath, buildNumber, offset)
+	tailResp, err := opts.callJenkins(ctx, client, http.MethodGet, tailPath, nil, map[string]string{"Accept": "text/plain"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to make tail request: %w", err)
 	}
@@ -663,7 +568,7 @@ func getBuildLogTail(ctx context.Context, opts *JenkinsOptions, jobName string, 
 }
 
 // getBuildLogs fetches build logs from Jenkins API with pagination support
-func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, offset, length int) (*BuildLogsResponse, error) {
+func (opts *JenkinsOptions) getBuildLogs(ctx context.Context, jobName string, buildNumber, offset, length int) (*BuildLogsResponse, error) {
 	client := opts.LogsClient
 
 	// Build Jenkins job path for nested jobs/folders
@@ -671,21 +576,8 @@ func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, bui
 
 	// Build the API URL for build logs with range parameters
 	// Jenkins supports HTTP Range headers for log pagination
-	apiURL := fmt.Sprintf("%s%s/%d/logText/progressiveText?start=%d",
-		strings.TrimRight(opts.URL, "/"), jobPath, buildNumber, offset)
-
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "text/plain")
-
-	// Make the request
-	resp, err := client.Do(req)
+	apiPath := fmt.Sprintf("%s/%d/logText/progressiveText?start=%d", jobPath, buildNumber, offset)
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, apiPath, nil, map[string]string{"Accept": "text/plain"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -744,27 +636,15 @@ func getBuildLogs(ctx context.Context, opts *JenkinsOptions, jobName string, bui
 }
 
 // getJenkinsJob fetches a specific job from Jenkins API by name
-func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*JenkinsJob, error) {
+func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (*JenkinsJob, error) {
 	client := opts.Client
 
 	// Build Jenkins job path for nested jobs/folders
 	jobPath := buildJobPath(jobName)
 
 	// Build the API URL for the specific job with expanded parameter information
-	apiURL := strings.TrimRight(opts.URL, "/") + jobPath + "/api/json?tree=name,url,color,buildable,description,lastBuild[number,url],property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]"
-
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "application/json")
-
-	// Make the request
-	resp, err := client.Do(req)
+	apiPath := jobPath + "/api/json?tree=name,url,color,buildable,description,lastBuild[number,url],property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]"
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, apiPath, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -838,7 +718,7 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 
 	// If there's a last build, fetch its details
 	if jobData.LastBuild != nil {
-		build, err := getBuildDetails(ctx, opts, jobData.LastBuild.URL)
+		build, err := opts.getBuildDetails(ctx, jobData.LastBuild.URL)
 		if err != nil {
 			log.Printf("Warning: failed to get build details for %s: %v", jobData.Name, err)
 			// Still include the job but without detailed build info
@@ -855,24 +735,11 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 }
 
 // getJenkinsJobs fetches jobs from Jenkins API
-func getJenkinsJobs(ctx context.Context, opts *JenkinsOptions) ([]JenkinsJob, error) {
+func (opts *JenkinsOptions) getJenkinsJobs(ctx context.Context) ([]JenkinsJob, error) {
 	client := opts.Client
 
 	// Build the API URL
-	apiURL := strings.TrimRight(opts.URL, "/") + "/api/json?tree=jobs[name,url,color,buildable,description,lastBuild[number,url]]"
-
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "application/json")
-
-	// Make the request
-	resp, err := client.Do(req)
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, "/api/json?tree=jobs[name,url,color,buildable,description,lastBuild[number,url]]", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -913,52 +780,47 @@ func getJenkinsJobs(ctx context.Context, opts *JenkinsOptions) ([]JenkinsJob, er
 		}
 	}
 
-	if len(work) > 0 {
-		workers := 6
-		if len(work) < workers {
-			workers = len(work)
-		}
-		ch := make(chan workItem)
-		var wg sync.WaitGroup
-		for w := 0; w < workers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for it := range ch {
-					build, err := getBuildDetails(ctx, opts, it.url)
-					if err != nil {
-						log.Printf("Warning: failed to get build details for %s: %v", it.name, err)
+	ch := make(chan workItem)
+	wg := sync.WaitGroup{}
+	firstErr := atomic.Pointer[error]{}
+	for range min(len(work), 16) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for it := range ch {
+				if firstErr.Load() != nil {
+					continue
+				}
+				build, err := opts.getBuildDetails(ctx, it.url)
+				if err != nil {
+					if firstErr.CompareAndSwap(nil, &err) {
 						continue
 					}
-					jobs[it.idx].LastBuild = build
+					log.Printf("Warning: failed to get build details for %s: %v", it.name, err)
+					continue
 				}
-			}()
-		}
-		for _, it := range work {
-			ch <- it
-		}
-		close(ch)
-		wg.Wait()
+				jobs[it.idx].LastBuild = build
+			}
+		}()
+	}
+	for _, it := range work {
+		ch <- it
+	}
+	close(ch)
+	wg.Wait()
+
+	if err := firstErr.Load(); err != nil {
+		return nil, *err
 	}
 
 	return jobs, nil
 }
 
 // getBuildDetails fetches detailed information about a specific build
-func getBuildDetails(ctx context.Context, opts *JenkinsOptions, buildURL string) (*Build, error) {
+func (opts *JenkinsOptions) getBuildDetails(ctx context.Context, buildURL string) (*Build, error) {
 	// Add /api/json to the build URL if not already present
 	apiURL := strings.TrimRight(buildURL, "/") + "/api/json"
-
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := opts.Client.Do(req)
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiURL, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -992,24 +854,11 @@ func getBuildDetails(ctx context.Context, opts *JenkinsOptions, buildURL string)
 }
 
 // getRunningBuilds fetches currently running builds from Jenkins API
-func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild, error) {
+func (opts *JenkinsOptions) getRunningBuilds(ctx context.Context) ([]RunningBuild, error) {
 	client := opts.Client
 
 	// Build the API URL for computer information (includes executors)
-	apiURL := strings.TrimRight(opts.URL, "/") + "/computer/api/json?tree=computer[displayName,executors[currentExecutable[url,fullDisplayName,timestamp],idle,likelyStuck,progress]]"
-
-	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add basic auth header
-	req.SetBasicAuth(opts.User, opts.Token)
-	req.Header.Set("Accept", "application/json")
-
-	// Make the request
-	resp, err := client.Do(req)
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, "/computer/api/json?tree=computer[displayName,executors[currentExecutable[url,fullDisplayName,timestamp],idle,likelyStuck,progress]]", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -1082,7 +931,7 @@ func getRunningBuilds(ctx context.Context, opts *JenkinsOptions) ([]RunningBuild
 }
 
 // waitForRunningBuild waits for a Jenkins build to complete or timeout
-func waitForRunningBuild(ctx context.Context, opts *JenkinsOptions, jobName string, buildNumber, timeoutSeconds int) (*WaitForRunningBuildResponse, error) {
+func (opts *JenkinsOptions) waitForRunningBuild(ctx context.Context, jobName string, buildNumber, timeoutSeconds int) (*WaitForRunningBuildResponse, error) {
 	startTime := time.Now()
 	timeout := time.Duration(timeoutSeconds) * time.Second
 	pollInterval := 5 * time.Second // Poll every 5 seconds
@@ -1115,7 +964,7 @@ func waitForRunningBuild(ctx context.Context, opts *JenkinsOptions, jobName stri
 
 		case <-ticker.C:
 			// Poll the build status
-			build, err := getBuildDetails(ctx, opts, buildURL)
+			build, err := opts.getBuildDetails(ctx, buildURL)
 			if err != nil {
 				// If we can't get build details, continue polling
 				// This might happen if the build hasn't started yet
@@ -1194,12 +1043,12 @@ func parseBuildNumberFromURL(u string) int {
 	return n
 }
 
-func AddTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
+func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
 	t.InputSchema = jsonschemaForExt[In]()
-	s.AddTool(mcp.ToolFor[In, Out](t, h))
+	s.AddTool(mcp.ToolFor(t, h))
 }
 
-func StructuredResult[Out any](out Out) (*mcp.CallToolResult, Out, error) {
+func structuredResult[Out any](out Out) (*mcp.CallToolResult, Out, error) {
 	b, err := json.Marshal(out)
 	if err != nil {
 		var zero Out
@@ -1209,4 +1058,67 @@ func StructuredResult[Out any](out Out) (*mcp.CallToolResult, Out, error) {
 		Content:           []mcp.Content{&mcp.TextContent{Text: string(b)}},
 		StructuredContent: out,
 	}, out, nil
+}
+
+func main() {
+	// Prepare options and bind flags directly to fields.
+	opts := &JenkinsOptions{}
+	var (
+		httpAddr string
+		useStdio bool
+	)
+
+	flag.StringVar(&opts.URL, "url", "", "Jenkins URL (required)")
+	flag.StringVar(&opts.Auth, "auth", "", "Jenkins authentication in format 'user:api_token' (required)")
+	flag.StringVar(&httpAddr, "http", "", "if set, use streamable HTTP at this address, instead of stdin/stdout")
+	flag.BoolVar(&useStdio, "stdio", true, "use stdio transport (ignored if -http is set)")
+	flag.Parse()
+
+	// Validate required parameters
+	if opts.URL == "" {
+		fmt.Fprintln(os.Stderr, "Error: -url parameter is required")
+		os.Exit(1)
+	}
+	if opts.Auth == "" {
+		fmt.Fprintln(os.Stderr, "Error: -auth parameter is required")
+		os.Exit(1)
+	}
+
+	// Validate auth format
+	if !strings.Contains(opts.Auth, ":") {
+		fmt.Fprintln(os.Stderr, "Error: -auth must be in format 'user:api_token'")
+		os.Exit(1)
+	}
+
+	// Parse user/token and initialize HTTP clients
+	parts := strings.SplitN(opts.Auth, ":", 2)
+	opts.User, opts.Token = parts[0], parts[1]
+	opts.Client = &http.Client{Timeout: 30 * time.Second}
+	opts.LogsClient = &http.Client{Timeout: 60 * time.Second}
+
+	log.Printf("Using Jenkins URL: %s", opts.URL)
+	log.Printf("Using Jenkins auth for user: %s", strings.Split(opts.Auth, ":")[0])
+
+	// Build MCP server
+	server := mcp.NewServer(&mcp.Implementation{Name: "jenkins-mcp-go", Version: "0.1.0"}, nil)
+
+	opts.addTools(server)
+
+	// Choose transport
+	if httpAddr != "" {
+		handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server }, nil)
+		log.Printf("Starting MCP HTTP server on %s", httpAddr)
+		if err := http.ListenAndServe(httpAddr, handler); err != nil {
+			log.Fatalf("http server error: %v", err)
+		}
+	} else if useStdio {
+		log.Printf("Starting MCP server over stdio")
+		t := &mcp.LoggingTransport{Transport: &mcp.StdioTransport{}, Writer: os.Stderr}
+		if err := server.Run(context.Background(), t); err != nil {
+			log.Printf("server error: %v", err)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Error: no transport selected. Use -http or -stdio.")
+		os.Exit(1)
+	}
 }
