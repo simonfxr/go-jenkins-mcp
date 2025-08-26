@@ -57,10 +57,6 @@ func jsonschemaForExt[T any]() *jsonschema.Schema {
 			sch.Properties[name] = p
 		}
 
-		if desc := f.Tag.Get("mcp"); desc != "" {
-			p.Description = desc
-		}
-
 		if def := f.Tag.Get("default"); def != "" {
 			// Heuristically encode default literal
 			if _, err := strconv.ParseInt(def, 10, 64); err == nil {

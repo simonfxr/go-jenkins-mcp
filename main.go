@@ -35,7 +35,7 @@ type getJobsArgs struct {
 
 // getJobArgs are the tool arguments for get_job.
 type getJobArgs struct {
-	Name string `json:"name" mcp:"Name of the Jenkins job to retrieve"`
+	Name string `json:"name" jsonschema:"Name of the Jenkins job to retrieve"`
 }
 
 // getRunningBuildsArgs are the tool arguments for get_running_builds.
@@ -45,32 +45,31 @@ type getRunningBuildsArgs struct {
 
 // getBuildLogsArgs are the tool arguments for get_build_logs.
 type getBuildLogsArgs struct {
-	Name        string `json:"name" mcp:"Name of the Jenkins job"`
-	BuildNumber int    `json:"build_number" mcp:"Build number to get logs for"`
-	Offset      int    `json:"offset,omitempty" mcp:"Starting byte offset in the log file (default: 0)" default:"0"`
-	Length      int    `json:"length,omitempty" mcp:"Maximum number of bytes to retrieve (default: 8192)" default:"8192"`
+	Name        string `json:"job_name" jsonschema:"Name of the Jenkins job"`
+	BuildNumber int    `json:"build_number" jsonschema:"Build number to get logs for"`
+	Offset      int    `json:"offset,omitempty" jsonschema:"Starting byte offset in the log file (default: 0)" default:"0"`
+	Length      int    `json:"length,omitempty" jsonschema:"Maximum number of bytes to retrieve (default: 8192)" default:"8192"`
 }
 
 // getBuildLogTailArgs are the tool arguments for get_build_log_tail.
 type getBuildLogTailArgs struct {
-	JobName     string `json:"job_name" mcp:"Name of the Jenkins job"`
-	BuildNumber int    `json:"build_number" mcp:"Build number to get logs for"`
-	MaxLength   int    `json:"max_length,omitempty" mcp:"Maximum bytes from end of log to retrieve (default: 8192)" default:"8192"`
+	JobName     string `json:"job_name" jsonschema:"Name of the Jenkins job"`
+	BuildNumber int    `json:"build_number" jsonschema:"Build number to get logs for"`
+	MaxLength   int    `json:"max_length,omitempty" jsonschema:"Maximum bytes from end of log to retrieve (default: 8192)" default:"8192"`
 }
 
 // startJobArgs are the tool arguments for start_job.
 type startJobArgs struct {
-	JobName    string                 `json:"job_name" mcp:"Name/path of the Jenkins job (supports folders)"`
-	Parameters map[string]interface{} `json:"parameters,omitempty" mcp:"Optional key/value map of build parameters"`
-	// wait: "none" (default), "queued", or "started"
-	Wait string `json:"wait,omitempty" mcp:"When to return: 'none' (default), 'queued', or 'started'" default:"none"`
+	JobName    string         `json:"job_name" jsonschema:"Name/path of the Jenkins job (supports folders)"`
+	Parameters map[string]any `json:"parameters,omitempty" jsonschema:"Optional key/value map of build parameters"`
+	Wait       string         `json:"wait,omitempty" jsonschema:"When to return: 'none', 'queued' (default), or 'started'" default:"queued"`
 }
 
 // waitForRunningBuildArgs are the tool arguments for wait_for_running_build.
 type waitForRunningBuildArgs struct {
-	JobName        string `json:"job_name" mcp:"Name of the Jenkins job"`
-	BuildNumber    int    `json:"build_number" mcp:"Build number to wait for"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" mcp:"Maximum time to wait in seconds (default: 600)" default:"600"`
+	JobName        string `json:"job_name" jsonschema:"Name of the Jenkins job"`
+	BuildNumber    int    `json:"build_number" jsonschema:"Build number to wait for"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"Maximum time to wait in seconds (default: 600)" default:"600"`
 }
 
 // StartJobResponse represents the response from start_job
@@ -114,6 +113,10 @@ type RunningBuild struct {
 	Progress    int    `json:"progress"`  // Progress percentage (if available)
 }
 
+type RunningBuilds struct {
+	Builds []RunningBuild
+}
+
 // JenkinsOptions bundles configuration for Jenkins API calls.
 type JenkinsOptions struct {
 	URL        string
@@ -135,13 +138,17 @@ type JenkinsJob struct {
 	Parameters  []BuildParameter `json:"parameters"`  // Build parameters
 }
 
+type JenkinsJobs struct {
+	JobList []JenkinsJob
+}
+
 // BuildParameter represents a Jenkins build parameter
 type BuildParameter struct {
-	Name         string      `json:"name"`
-	Type         string      `json:"type"`
-	Description  string      `json:"description"`
-	DefaultValue interface{} `json:"defaultValue"`
-	Choices      []string    `json:"choices,omitempty"` // For choice parameters
+	Name         string   `json:"name"`
+	Type         string   `json:"type"`
+	Description  string   `json:"description"`
+	DefaultValue any      `json:"defaultValue"`
+	Choices      []string `json:"choices,omitempty"` // For choice parameters
 }
 
 // Build represents a Jenkins build
@@ -212,143 +219,136 @@ func main() {
 	server := mcp.NewServer(&mcp.Implementation{Name: "jenkins-mcp-go", Version: "0.1.0"}, nil)
 
 	// get_jobs
-	jobsTool := &mcp.Tool{Name: getJobsToolName, Description: "Get list of Jenkins jobs with their current status"}
-	jobsTool.InputSchema = jsonschemaForExt[getJobsArgs]()
-	mcp.AddTool(server, jobsTool, func(ctx context.Context, req *mcp.CallToolRequest, args getJobsArgs) (*mcp.CallToolResult, []JenkinsJob, error) {
-		jobs, err := getJenkinsJobs(ctx, opts)
-		if err != nil {
-			return nil, nil, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Fetched %d jobs", len(jobs))}}
-		return &res, jobs, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        getJobsToolName,
+		Description: "Get list of Jenkins jobs with their current status"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args getJobsArgs) (*mcp.CallToolResult, JenkinsJobs, error) {
+			jobs, err := getJenkinsJobs(ctx, opts)
+			if err != nil {
+				return nil, JenkinsJobs{}, err
+			}
+			return nil, JenkinsJobs{jobs}, nil
+		})
 
 	// get_job
-	jobTool := &mcp.Tool{Name: getJobToolName, Description: "Get detailed information about a specific Jenkins job by name"}
-	jobTool.InputSchema = jsonschemaForExt[getJobArgs]()
-	mcp.AddTool(server, jobTool, func(ctx context.Context, req *mcp.CallToolRequest, args getJobArgs) (*mcp.CallToolResult, JenkinsJob, error) {
-		if strings.TrimSpace(args.Name) == "" {
-			return nil, JenkinsJob{}, fmt.Errorf("missing required argument: name")
-		}
-		job, err := getJenkinsJob(ctx, opts, args.Name)
-		if err != nil {
-			return nil, JenkinsJob{}, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Fetched job %s", job.Name)}}
-		return &res, *job, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        getJobToolName,
+		Description: "Get detailed information about a specific Jenkins job by name"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args getJobArgs) (*mcp.CallToolResult, JenkinsJob, error) {
+			if strings.TrimSpace(args.Name) == "" {
+				return nil, JenkinsJob{}, fmt.Errorf("missing required argument: name")
+			}
+			job, err := getJenkinsJob(ctx, opts, args.Name)
+			if err != nil {
+				return nil, JenkinsJob{}, err
+			}
+			return StructuredResult(*job)
+		})
 
 	// get_running_builds
-	runningTool := &mcp.Tool{Name: getRunningBuildsToolName, Description: "Get list of currently running Jenkins builds"}
-	runningTool.InputSchema = jsonschemaForExt[getRunningBuildsArgs]()
-	mcp.AddTool(server, runningTool, func(ctx context.Context, req *mcp.CallToolRequest, args getRunningBuildsArgs) (*mcp.CallToolResult, []RunningBuild, error) {
-		runningBuilds, err := getRunningBuilds(ctx, opts)
-		if err != nil {
-			return nil, nil, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Fetched %d running builds", len(runningBuilds))}}
-		return &res, runningBuilds, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        getRunningBuildsToolName,
+		Description: "Get list of currently running Jenkins builds"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args getRunningBuildsArgs) (*mcp.CallToolResult, RunningBuilds, error) {
+			runningBuilds, err := getRunningBuilds(ctx, opts)
+			if err != nil {
+				return nil, RunningBuilds{}, err
+			}
+			return StructuredResult(RunningBuilds{runningBuilds})
+		})
 
 	// get_build_logs
-	logsTool := &mcp.Tool{Name: getBuildLogsToolName, Description: "Get build logs for a specific Jenkins job and build number with pagination support"}
-	logsTool.InputSchema = jsonschemaForExt[getBuildLogsArgs]()
-	mcp.AddTool(server, logsTool, func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogsArgs) (*mcp.CallToolResult, BuildLogsResponse, error) {
-		if strings.TrimSpace(args.Name) == "" {
-			return nil, BuildLogsResponse{}, fmt.Errorf("missing required argument: name")
-		}
-		if args.BuildNumber <= 0 {
-			return nil, BuildLogsResponse{}, fmt.Errorf("missing or invalid required argument: build_number (must be > 0)")
-		}
-		if args.Length <= 0 {
-			args.Length = 8192
-		}
-		if args.Offset < 0 {
-			args.Offset = 0
-		}
-		logsResponse, err := getBuildLogs(ctx, opts, args.Name, args.BuildNumber, args.Offset, args.Length)
-		if err != nil {
-			return nil, BuildLogsResponse{}, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Fetched %d bytes from offset %d", logsResponse.Length, logsResponse.Offset)}}
-		return &res, *logsResponse, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        getBuildLogsToolName,
+		Description: "Get build logs for a specific Jenkins job and build number with pagination support"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogsArgs) (*mcp.CallToolResult, any, error) {
+			if strings.TrimSpace(args.Name) == "" {
+				return nil, nil, fmt.Errorf("missing required argument: name")
+			}
+			if args.BuildNumber <= 0 {
+				return nil, nil, fmt.Errorf("missing or invalid required argument: build_number (must be > 0)")
+			}
+			if args.Length <= 0 {
+				args.Length = 8192
+			}
+			if args.Offset < 0 {
+				args.Offset = 0
+			}
+			logsResponse, err := getBuildLogs(ctx, opts, args.Name, args.BuildNumber, args.Offset, args.Length)
+			if err != nil {
+				return nil, nil, err
+			}
+			var res mcp.CallToolResult
+			res.Content = []mcp.Content{&mcp.TextContent{Text: logsResponse.Logs}}
+			return &res, nil, nil
+		})
 
 	// get_build_log_tail
-	tailTool := &mcp.Tool{Name: getBuildLogTailToolName, Description: "Get the tail of build logs for a specific Jenkins job and build number - useful for seeing why builds failed"}
-	tailTool.InputSchema = jsonschemaForExt[getBuildLogTailArgs]()
-	mcp.AddTool(server, tailTool, func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogTailArgs) (*mcp.CallToolResult, BuildLogsResponse, error) {
-		if strings.TrimSpace(args.JobName) == "" {
-			return nil, BuildLogsResponse{}, fmt.Errorf("missing required argument: job_name")
-		}
-		if args.BuildNumber <= 0 {
-			return nil, BuildLogsResponse{}, fmt.Errorf("missing or invalid required argument: build_number (must be > 0)")
-		}
-		if args.MaxLength <= 0 {
-			args.MaxLength = 8192
-		}
-		logsResponse, err := getBuildLogTail(ctx, opts, args.JobName, args.BuildNumber, args.MaxLength)
-		if err != nil {
-			return nil, BuildLogsResponse{}, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Fetched tail: %d bytes", logsResponse.Length)}}
-		return &res, *logsResponse, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        getBuildLogTailToolName,
+		Description: "Get the tail of build logs for a specific Jenkins job and build number - useful for seeing why builds failed"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args getBuildLogTailArgs) (*mcp.CallToolResult, any, error) {
+			if strings.TrimSpace(args.JobName) == "" {
+				return nil, nil, fmt.Errorf("missing required argument: job_name")
+			}
+			if args.BuildNumber <= 0 {
+				return nil, nil, fmt.Errorf("missing or invalid required argument: build_number (must be > 0)")
+			}
+			if args.MaxLength <= 0 {
+				args.MaxLength = 8192
+			}
+			logsResponse, err := getBuildLogTail(ctx, opts, args.JobName, args.BuildNumber, args.MaxLength)
+			if err != nil {
+				return nil, nil, err
+			}
+			var res mcp.CallToolResult
+			res.Content = []mcp.Content{&mcp.TextContent{Text: logsResponse.Logs}}
+			return &res, nil, nil
+		})
 
 	// start_job
-	startTool := &mcp.Tool{Name: startJobToolName, Description: "Trigger a Jenkins job build with optional parameters and wait behavior"}
-	startTool.InputSchema = jsonschemaForExt[startJobArgs]()
-	mcp.AddTool(server, startTool, func(ctx context.Context, req *mcp.CallToolRequest, args startJobArgs) (*mcp.CallToolResult, StartJobResponse, error) {
-		if strings.TrimSpace(args.JobName) == "" {
-			return nil, StartJobResponse{}, fmt.Errorf("missing required argument: job_name")
-		}
-		if args.Wait == "" {
-			args.Wait = "none"
-		}
-		switch args.Wait {
-		case "none", "queued", "started":
-		default:
-			return nil, StartJobResponse{}, fmt.Errorf("invalid wait value: expected 'none', 'queued', or 'started'")
-		}
-		resObj, err := startJob(ctx, opts, args.JobName, args.Parameters, args.Wait)
-		if err != nil {
-			return nil, StartJobResponse{}, err
-		}
-		var res mcp.CallToolResult
-		msg := fmt.Sprintf("Triggered job %s", args.JobName)
-		if resObj.BuildNumber > 0 {
-			msg = fmt.Sprintf("Job %s started as build #%d", args.JobName, resObj.BuildNumber)
-		}
-		res.Content = []mcp.Content{&mcp.TextContent{Text: msg}}
-		return &res, *resObj, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        startJobToolName,
+		Description: "Trigger a Jenkins job build with optional parameters and wait behavior"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args startJobArgs) (*mcp.CallToolResult, StartJobResponse, error) {
+			if strings.TrimSpace(args.JobName) == "" {
+				return nil, StartJobResponse{}, fmt.Errorf("missing required argument: job_name")
+			}
+			if args.Wait == "" {
+				args.Wait = "queued"
+			}
+			switch args.Wait {
+			case "none", "queued", "started":
+			default:
+				return nil, StartJobResponse{}, fmt.Errorf("invalid wait value: expected 'none', 'queued', or 'started'")
+			}
+			resObj, err := startJob(ctx, opts, args.JobName, args.Parameters, args.Wait)
+			if err != nil {
+				return nil, StartJobResponse{}, err
+			}
+			return StructuredResult(*resObj)
+		})
 
 	// wait_for_running_build
-	waitTool := &mcp.Tool{Name: waitForRunningBuildToolName, Description: "Wait for a running Jenkins build to complete or timeout"}
-	waitTool.InputSchema = jsonschemaForExt[waitForRunningBuildArgs]()
-	mcp.AddTool(server, waitTool, func(ctx context.Context, req *mcp.CallToolRequest, args waitForRunningBuildArgs) (*mcp.CallToolResult, WaitForRunningBuildResponse, error) {
-		if strings.TrimSpace(args.JobName) == "" {
-			return nil, WaitForRunningBuildResponse{}, fmt.Errorf("missing required argument: job_name")
-		}
-		if args.BuildNumber <= 0 {
-			return nil, WaitForRunningBuildResponse{}, fmt.Errorf("missing or invalid required argument: build_number")
-		}
-		if args.TimeoutSeconds <= 0 {
-			args.TimeoutSeconds = 600
-		}
-		resObj, err := waitForRunningBuild(ctx, opts, args.JobName, args.BuildNumber, args.TimeoutSeconds)
-		if err != nil {
-			return nil, WaitForRunningBuildResponse{}, err
-		}
-		var res mcp.CallToolResult
-		res.Content = []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Build %s #%d finished with %s", args.JobName, args.BuildNumber, resObj.Result)}}
-		return &res, *resObj, nil
-	})
+	AddTool(server, &mcp.Tool{
+		Name:        waitForRunningBuildToolName,
+		Description: "Wait for a running Jenkins build to complete or timeout"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args waitForRunningBuildArgs) (*mcp.CallToolResult, WaitForRunningBuildResponse, error) {
+			if strings.TrimSpace(args.JobName) == "" {
+				return nil, WaitForRunningBuildResponse{}, fmt.Errorf("missing required argument: job_name")
+			}
+			if args.BuildNumber <= 0 {
+				return nil, WaitForRunningBuildResponse{}, fmt.Errorf("missing or invalid required argument: build_number")
+			}
+			if args.TimeoutSeconds <= 0 {
+				args.TimeoutSeconds = 600
+			}
+			resObj, err := waitForRunningBuild(ctx, opts, args.JobName, args.BuildNumber, args.TimeoutSeconds)
+			if err != nil {
+				return nil, WaitForRunningBuildResponse{}, err
+			}
+			return StructuredResult(*resObj)
+		})
 
 	// Choose transport
 	if httpAddr != "" {
@@ -421,7 +421,7 @@ func getCrumb(ctx context.Context, opts *JenkinsOptions) (field, crumb string, o
 }
 
 // startJob triggers a Jenkins job, optionally with parameters, and optionally waits.
-func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params map[string]interface{}, wait string) (*StartJobResponse, error) {
+func startJob(ctx context.Context, opts *JenkinsOptions, jobName string, params map[string]any, wait string) (*StartJobResponse, error) {
 	jobPath := buildJobPath(jobName)
 	base := strings.TrimRight(opts.URL, "/")
 
@@ -796,7 +796,7 @@ func getJenkinsJob(ctx context.Context, opts *JenkinsOptions, jobName string) (*
 				Type                  string `json:"type"`
 				Description           string `json:"description"`
 				DefaultParameterValue *struct {
-					Value interface{} `json:"value"`
+					Value any `json:"value"`
 				} `json:"defaultParameterValue"`
 				Choices []string `json:"choices"`
 			} `json:"parameterDefinitions"`
@@ -1192,4 +1192,21 @@ func parseBuildNumberFromURL(u string) int {
 		return 0
 	}
 	return n
+}
+
+func AddTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
+	t.InputSchema = jsonschemaForExt[In]()
+	s.AddTool(mcp.ToolFor[In, Out](t, h))
+}
+
+func StructuredResult[Out any](out Out) (*mcp.CallToolResult, Out, error) {
+	b, err := json.Marshal(out)
+	if err != nil {
+		var zero Out
+		return nil, zero, err
+	}
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(b)}},
+		StructuredContent: out,
+	}, out, nil
 }
