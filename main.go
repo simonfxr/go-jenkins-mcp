@@ -257,7 +257,7 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 			if strings.TrimSpace(args.JobName) == "" {
 				return nil, StartJobResponse{}, fmt.Errorf("missing required argument: job_name")
 			}
-			// Hardcode the behavior to 'started' (wait until build starts)
+			// Hardcode the behavior to 'queued' (return after getting queue URL)
 			resObj, err := opts.startJob(ctx, args.JobName, args.Parameters)
 			if err != nil {
 				return nil, StartJobResponse{}, err
@@ -411,57 +411,8 @@ func (opts *JenkinsOptions) startJob(ctx context.Context, jobName string, params
 		result.QueueURL = queueURL
 	}
 
-	// Hardcoded 'started' behavior: wait until the queue item gets an executable
-	if queueURL == "" {
-		return result, nil // cannot wait without queue URL
-	}
-	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-waitCtx.Done():
-			return result, nil
-		case <-ticker.C:
-			qresp, err := opts.callJenkins(waitCtx, opts.Client, http.MethodGet, strings.TrimRight(queueURL, "/")+"/api/json", nil, nil)
-			if err != nil {
-				continue
-			}
-			func() {
-				defer qresp.Body.Close()
-				if qresp.StatusCode != http.StatusOK {
-					return
-				}
-				var q struct {
-					Cancelled  bool `json:"cancelled"`
-					Executable *struct {
-						Number int    `json:"number"`
-						URL    string `json:"url"`
-					} `json:"executable"`
-				}
-				if err := json.NewDecoder(qresp.Body).Decode(&q); err != nil {
-					return
-				}
-				if q.Cancelled {
-					// leave result without build info
-					return
-				}
-				if q.Executable != nil {
-					result.BuildNumber = q.Executable.Number
-					result.BuildURL = q.Executable.URL
-					// done
-					cancel()
-				}
-			}()
-		}
-		if waitCtx.Err() != nil {
-			return result, nil
-		}
-		if result.BuildNumber > 0 || result.BuildURL != "" {
-			return result, nil
-		}
-	}
+	// Hardcoded 'queued' behavior: return immediately after getting queue URL
+	return result, nil
 }
 
 // getBuildLogTail fetches the tail of build logs from Jenkins API
