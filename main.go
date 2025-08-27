@@ -374,6 +374,15 @@ func (opts *JenkinsOptions) getCrumb(ctx context.Context) (field, crumb string, 
 	return data.Field, data.Crumb, true, nil
 }
 
+// QueueItem represents a Jenkins queue item
+type QueueItem struct {
+	ID         int `json:"id"`
+	Executable struct {
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+	} `json:"executable"`
+}
+
 // startJob triggers a Jenkins job, optionally with parameters, and optionally waits.
 func (opts *JenkinsOptions) startJob(ctx context.Context, jobName string, params map[string]any) (*StartJobResponse, error) {
 	jobPath := buildJobPath(jobName)
@@ -409,10 +418,50 @@ func (opts *JenkinsOptions) startJob(ctx context.Context, jobName string, params
 	result := &StartJobResponse{JobName: jobName}
 	if queueURL != "" {
 		result.QueueURL = queueURL
+
+		// Extract queue item ID and fetch build details
+		if queueID := extractQueueID(queueURL); queueID != "" {
+			if buildNumber, buildURL := opts.getQueueItemDetails(ctx, queueID); buildNumber > 0 {
+				result.BuildNumber = buildNumber
+				result.BuildURL = buildURL
+			}
+		}
 	}
 
 	// Hardcoded 'queued' behavior: return immediately after getting queue URL
 	return result, nil
+}
+
+// extractQueueID extracts queue item ID from queue URL
+func extractQueueID(queueURL string) string {
+	// Extract ID from URL like "https://jenkins.example.com/queue/item/19069/"
+	parts := strings.Split(strings.TrimSuffix(queueURL, "/"), "/")
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
+// getQueueItemDetails fetches build number and URL from queue item
+func (opts *JenkinsOptions) getQueueItemDetails(ctx context.Context, queueID string) (int, string) {
+	apiPath := "/queue/item/" + queueID + "/api/json"
+
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiPath, nil, nil)
+	if err != nil {
+		return 0, ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, ""
+	}
+
+	var queueItem QueueItem
+	if err := json.NewDecoder(resp.Body).Decode(&queueItem); err != nil {
+		return 0, ""
+	}
+
+	return queueItem.Executable.Number, queueItem.Executable.URL
 }
 
 // getBuildLogTail fetches the tail of build logs from Jenkins API
