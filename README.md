@@ -152,16 +152,24 @@ Status values:
 
 **Requirements**
 - CLI: `-url <jenkins_url>` (required) - Jenkins server URL
-- CLI: `-auth "<user>:<api_token>"` (required) - Jenkins authentication credentials
+- CLI: `-auth "<user>:<api_token>"` (optional) - Jenkins authentication credentials
+- ENV: `JENKINS_MCP_AUTH="<user>:<api_token>"` (optional) - Alternative to `-auth` flag
 - CLI: `-stdio` (default true) for stdio, or `-http <addr>` for Streamable HTTP.
+
+**Authentication**
+Authentication can be provided in two ways:
+1. Command line flag: `-auth "user:token"`
+2. Environment variable: `JENKINS_MCP_AUTH="user:token"`
+
+If both are provided, the `-auth` flag takes precedence.
 
 **Run (stdio)**
 - Build: `go build -o jenkins-mcp-go .`
 - Run (stdio): execute with required parameters; an MCP host (e.g., Claude Desktop) should launch this binary with stdio wiring.
 
 Examples:
-- `./jenkins-mcp-go -url "https://jenkins.example.com" -auth "myuser:myapitoken"`
-- HTTP mode: `./jenkins-mcp-go -url "https://jenkins.example.com" -auth "myuser:myapitoken" -http :8080`
+- `JENKINS_MCP_AUTH="myuser:myapitoken" ./jenkins-mcp-go -url "https://jenkins.example.com"`
+- HTTP mode: `JENKINS_MCP_AUTH="myuser:myapitoken" ./jenkins-mcp-go -url "https://jenkins.example.com" -http :8080`
 
 **Smithery / Hosts**
 - Configure your MCP host to run this server over stdio with the required parameters.

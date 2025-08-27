@@ -1069,7 +1069,7 @@ func main() {
 	)
 
 	flag.StringVar(&opts.URL, "url", "", "Jenkins URL (required)")
-	flag.StringVar(&opts.Auth, "auth", "", "Jenkins authentication in format 'user:api_token' (required)")
+	flag.StringVar(&opts.Auth, "auth", "", "Jenkins authentication in format 'user:api_token' (optional if JENKINS_MCP_AUTH env var is set)")
 	flag.StringVar(&httpAddr, "http", "", "if set, use streamable HTTP at this address, instead of stdin/stdout")
 	flag.BoolVar(&useStdio, "stdio", true, "use stdio transport (ignored if -http is set)")
 	flag.Parse()
@@ -1079,9 +1079,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: -url parameter is required")
 		os.Exit(1)
 	}
+
+	// Use environment variable if -auth flag is not provided
 	if opts.Auth == "" {
-		fmt.Fprintln(os.Stderr, "Error: -auth parameter is required")
-		os.Exit(1)
+		if envAuth := os.Getenv("JENKINS_MCP_AUTH"); envAuth != "" {
+			opts.Auth = envAuth
+		} else {
+			fmt.Fprintln(os.Stderr, "Error: authentication required via -auth parameter or JENKINS_MCP_AUTH environment variable")
+			os.Exit(1)
+		}
 	}
 
 	// Validate auth format
