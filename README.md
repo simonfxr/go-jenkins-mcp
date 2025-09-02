@@ -8,42 +8,41 @@
 - Tool: `jenkins_get_jobs`
   - Description: Get list of Jenkins jobs with their current status
   - Arguments: None
-  - Returns: JSON array of Jenkins jobs with detailed information
+  - Returns: JSON array of jobs with basic information: `name`, `url`, `color`, `buildable`, `description`, and `lastBuild` when available
 
 - Tool: `jenkins_get_job`
-  - Description: Get detailed information about a specific Jenkins job by name
+  - Description: Get detailed information about a specific Jenkins job by name, including the last 10 builds
   - Arguments: `name` (required) - Name of the Jenkins job
-  - Returns: JSON object with detailed job information
+  - Returns: JSON object with detailed job information including recent build history
 
 - Tool: `jenkins_get_running_builds`
   - Description: Get list of currently running Jenkins builds
   - Arguments: None
-  - Returns: JSON array of running builds with execution details
+  - Returns: JSON array of running builds with fields: `jobName`, `buildNumber`, `url`, `startTime` (RFC3339 string), `duration` (human-readable), and optional `progress`
 
 - Tool: `jenkins_get_build_logs`
   - Description: Get build logs for a specific Jenkins job and build number with pagination support
   - Arguments: 
-    - `name` (required) - Name of the Jenkins job
+    - `job_name` (required) - Name of the Jenkins job
     - `build_number` (required) - Build number to get logs for
     - `offset` (optional, default: 0) - Starting byte offset in the log file
     - `length` (optional, default: 8192) - Maximum number of bytes to retrieve
-  - Returns: JSON object with log content and pagination information
+  - Returns: Plain text log content for the requested slice
 
 - Tool: `jenkins_get_build_log_tail`
-  - Description: Get the tail of build logs - useful for seeing why builds failed
+  - Description: Get the tail of build logs - useful for quick failure analysis
   - Arguments:
     - `job_name` (required) - Name of the Jenkins job
     - `build_number` (required) - Build number to get logs for
     - `max_length` (optional, default: 8192) - Maximum number of bytes to retrieve from the end
-  - Returns: JSON object with tail log content and metadata
+  - Returns: Plain text tail log content
 
 - Tool: `jenkins_start_job`
-  - Description: Trigger a Jenkins job build with optional parameters and wait options
+  - Description: Trigger a Jenkins job build with optional parameters
   - Arguments:
     - `job_name` (required) - Name/path of the Jenkins job (supports folders)
     - `parameters` (optional) - Object map of build parameters
-    - `wait` (optional, default: `none`) - One of `none`, `queued`, `started`
-  - Returns: JSON with `jobName`, `queueUrl` (if available), and for `wait=started`, `buildUrl` and `buildNumber`
+  - Returns: JSON with `jobName` and `queueUrl` (if available); may also include `buildUrl` and `buildNumber` when retrievable from the queue item.
 
 - Tool: `jenkins_wait_for_running_build`
   - Description: Wait for a running Jenkins build to complete or timeout
@@ -54,7 +53,7 @@
   - Returns: JSON object with build completion status and timing information
 
 **Job Format**
-Each job returned by `jenkins_get_jobs` includes:
+Each job returned by `jenkins_get_jobs` and `jenkins_get_job` includes:
 ```json
 {
   "name": "job-name",
@@ -62,14 +61,24 @@ Each job returned by `jenkins_get_jobs` includes:
   "color": "blue",
   "buildable": true,
   "description": "Job description",
-  "lastBuild": {
-    "number": 123,
-    "url": "https://jenkins.example.com/job/job-name/123/",
-    "building": false,
-    "result": "SUCCESS",
-    "timestamp": 1692614400000,
-    "duration": 120000
-  },
+  "recentBuilds": [
+    {
+      "number": 123,
+      "url": "https://jenkins.example.com/job/job-name/123/",
+      "building": false,
+      "result": "SUCCESS",
+      "timestamp": "2023-08-21T12:00:00Z",
+      "duration": "2m0s"
+    },
+    {
+      "number": 122,
+      "url": "https://jenkins.example.com/job/job-name/122/",
+      "building": false,
+      "result": "SUCCESS",
+      "timestamp": "2023-08-21T11:40:00Z",
+      "duration": "1m58s"
+    }
+  ],
   "parameters": [
     {
       "name": "MERGE_FEATURE",
@@ -80,7 +89,7 @@ Each job returned by `jenkins_get_jobs` includes:
     },
     {
       "name": "BUILD_TYPE",
-      "type": "ChoiceParameterDefinition", 
+      "type": "ChoiceParameterDefinition",
       "description": "Type of build to perform",
       "defaultValue": "release",
       "choices": ["debug", "release", "test"]
@@ -89,7 +98,9 @@ Each job returned by `jenkins_get_jobs` includes:
 }
 ```
 
-Note: The `jenkins_get_job` tool returns individual jobs with full parameter information, while `jenkins_get_jobs` returns the job list without parameters for performance.
+Note: `recentBuilds` are sorted by build number (descending - most recent first) and both `lastBuild` and `recentBuilds` fields are omitted when empty.
+
+Note: The `jenkins_get_job` tool returns individual jobs with full parameter information and recent build history (last 10 builds, sorted by number descending), while `jenkins_get_jobs` returns only basic job fields (no parameters or `recentBuilds`) for performance; it may include `lastBuild` when available.
 
 **Running Build Format**
 Each running build returned by `jenkins_get_running_builds` includes:
@@ -98,25 +109,18 @@ Each running build returned by `jenkins_get_running_builds` includes:
   "jobName": "job-name",
   "buildNumber": 124,
   "url": "https://jenkins.example.com/job/job-name/124/",
-  "startTime": 1692614500000,
-  "duration": 45000,
-  "executor": "master",
+  "startTime": "2023-08-21T12:01:40Z",
+  "duration": "45s",
   "progress": 75
 }
 ```
 
-**Build Logs Format**
-Build logs returned by `jenkins_get_build_logs` include:
-```json
-{
-  "jobName": "job-name",
-  "buildNumber": 124,
-  "offset": 0,
-  "length": 1024,
-  "totalSize": 5120,
-  "hasMore": true,
-  "logs": "Started by user admin\nBuilding in workspace..."
-}
+**Build Logs Result**
+`jenkins_get_build_logs` returns plain text containing the requested portion of the log. Control pagination via the `offset` and `length` arguments. Example output:
+```
+Started by user admin
+Building in workspace /var/lib/jenkins/workspace/job-name
+...
 ```
 
 **Wait for Build Format**
@@ -127,8 +131,8 @@ Build wait results returned by `jenkins_wait_for_running_build` include:
   "buildNumber": 124,
   "status": "success",
   "result": "SUCCESS",
-  "duration": 120000,
-  "waitTime": 45000,
+  "duration": "2m0s",
+  "waitTime": "45s",
   "timedOut": false
 }
 ```
@@ -180,21 +184,19 @@ Examples:
 - Uses Jenkins REST API `/computer/api/json` endpoint to fetch running builds from executors
 - Uses Jenkins REST API `/job/{jobName}/{buildNumber}/logText/progressiveText` endpoint for build logs
 - Implements smart tail log retrieval by calculating offset from total log size
-- Fetches detailed build information for each job's last build
-- Implements proper basic authentication
+- Implements proper basic authentication and includes Jenkins CSRF crumb for build triggers when available
 - 30-second timeout for API calls, 60-second timeout for log retrieval
-- Graceful error handling for individual build details and missing jobs/builds
+- Graceful error handling for missing jobs/builds
 - Parses job names and build numbers from executor information
 - Supports nested jobs/folders via Jenkins path convention `/job/<seg>/job/<seg>/...` and proper URL escaping
 - Supports log pagination with offset and length parameters
-- Detects running builds and provides hasMore flag for pagination
 - Optimized tail log retrieval for quick failure analysis
 
 **Notes**
 - Input validation: enforces required URL and auth parameters
 - Auth format: must be "user:api_token" format
 - Errors: returned as tool results with `isError=true` for LLM visibility
-- Build details are fetched concurrently for better performance
+- Timestamps are RFC3339 strings; durations are human-readable (e.g., "45s", "2m5s")
 
 **Transport**
 - `-http <addr>` starts Streamable HTTP; otherwise `-stdio` runs by default.
@@ -203,6 +205,6 @@ Examples:
 **TODO**
 - Add more Jenkins tools (get build status, etc.)
 - Add filtering options (by job name pattern, status, etc.)
-- Add support for Jenkins CSRF protection
 - Add SSL certificate validation options
-- Add caching for better performance
+- Optionally return structured metadata for log tools
+- Optional `wait` behavior modes for `jenkins_start_job`
