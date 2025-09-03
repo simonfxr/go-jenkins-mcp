@@ -172,7 +172,7 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 			if err != nil {
 				return nil, GetJobsToolResponse{}, err
 			}
-			return nil, GetJobsToolResponse{jobs}, nil
+			return structuredResult(GetJobsToolResponse{jobs})
 		})
 
 	addTool(s, &mcp.Tool{
@@ -429,32 +429,44 @@ func extractQueueID(queueURL string) string {
 	return ""
 }
 
-// getQueueItemDetails fetches build number and URL from queue item
+// getQueueItemDetails fetches build number and URL from queue item with retry
 func (opts *JenkinsOptions) getQueueItemDetails(ctx context.Context, queueID string) (int, string) {
 	apiPath := "/queue/item/" + queueID + "/api/json"
 
-	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiPath, nil, nil)
-	if err != nil {
-		return 0, ""
-	}
-	defer resp.Body.Close()
+	// Retry up to 8 times with 1s delay to wait for build to start (quiet period + executor assignment)
+	for i := 0; i < 8; i++ {
+		if i > 0 {
+			time.Sleep(1 * time.Second)
+		}
 
-	if resp.StatusCode != 200 {
-		return 0, ""
+		resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiPath, nil, nil)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			continue
+		}
+
+		var queueItem struct {
+			ID         int `json:"id"`
+			Executable struct {
+				Number int    `json:"number"`
+				URL    string `json:"url"`
+			} `json:"executable"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&queueItem); err != nil {
+			continue
+		}
+
+		// If we got a build number, return it
+		if queueItem.Executable.Number > 0 {
+			return queueItem.Executable.Number, queueItem.Executable.URL
+		}
 	}
 
-	var queueItem struct {
-		ID         int `json:"id"`
-		Executable struct {
-			Number int    `json:"number"`
-			URL    string `json:"url"`
-		} `json:"executable"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&queueItem); err != nil {
-		return 0, ""
-	}
-
-	return queueItem.Executable.Number, queueItem.Executable.URL
+	return 0, ""
 }
 
 // getBuildLogTail fetches the tail of build logs from jenkins api
