@@ -43,7 +43,8 @@ type GetRunningBuildsToolArgs struct {
 
 // GetRunningBuildsToolResponse contains the list of currently running builds.
 type GetRunningBuildsToolResponse struct {
-	Builds []RunningBuild
+	Builds []RunningBuild `json:"builds"`
+	Queued []QueuedBuild  `json:"queuedBuilds,omitempty"`
 }
 
 // GetBuildLogsToolArgs are the tool arguments for jenkins_get_build_logs.
@@ -130,6 +131,7 @@ type Job struct {
 	LastBuild    *Build           `json:"lastBuild,omitempty"`    // Most recent build info
 	RecentBuilds []Build          `json:"recentBuilds,omitempty"` // Last 10 builds
 	Parameters   []BuildParameter `json:"parameters"`             // Build parameters
+	QueuedBuilds []QueuedBuild    `json:"queuedBuilds,omitempty"` // Queued builds for this job
 }
 
 // BuildParameter represents a Jenkins build parameter
@@ -151,6 +153,18 @@ type Build struct {
 	Duration          DurationMS `json:"duration"`          // Human-readable in output, parses from ms
 	EstimatedDuration DurationMS `json:"estimatedDuration"` // Human-readable in output, parses from ms
 	DisplayName       string     `json:"displayName"`
+}
+
+// QueuedBuild represents a queued Jenkins build item
+type QueuedBuild struct {
+	JobName     string `json:"jobName"`
+	URL         string `json:"url"`
+	QueueID     int    `json:"queueId"`
+	Why         string `json:"why"`
+	QueuedSince TimeMS `json:"queuedSince"`
+	Stuck       bool   `json:"stuck"`
+	Buildable   bool   `json:"buildable"`
+	Parameters  string `json:"parameters,omitempty"`
 }
 
 // JenkinsOptions bundles configuration for jenkins api calls.
@@ -197,7 +211,12 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 			if err != nil {
 				return nil, GetRunningBuildsToolResponse{}, err
 			}
-			return structuredResult(GetRunningBuildsToolResponse{runningBuilds})
+			queuedBuilds, err := opts.getQueuedBuilds(ctx)
+			if err != nil {
+				// Degrade gracefully if queue endpoint is unavailable
+				queuedBuilds = nil
+			}
+			return structuredResult(GetRunningBuildsToolResponse{Builds: runningBuilds, Queued: queuedBuilds})
 		})
 
 	addTool(s, &mcp.Tool{
@@ -400,17 +419,25 @@ func (opts *JenkinsOptions) startJob(ctx context.Context, jobName string, params
 		return nil, fmt.Errorf("jenkins api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	// Capture queue URL from Location header if present
-	queueURL := resp.Header.Get("Location")
+	// Capture Location header if present. Jenkins typically returns a queue item URL,
+	// but in some cases it may point directly to the build URL if it started immediately.
+	loc := resp.Header.Get("Location")
 	result := &StartJobToolResponse{JobName: jobName}
-	if queueURL != "" {
-		result.QueueURL = queueURL
-
-		// Extract queue item ID and fetch build details
-		if queueID := extractQueueID(queueURL); queueID != "" {
-			if buildNumber, buildURL := opts.getQueueItemDetails(ctx, queueID); buildNumber > 0 {
-				result.BuildNumber = buildNumber
-				result.BuildURL = buildURL
+	if loc != "" {
+		if strings.Contains(loc, "/queue/item/") {
+			// Queue URL case
+			result.QueueURL = loc
+			if queueID := extractQueueID(loc); queueID != "" {
+				if buildNumber, buildURL := opts.getQueueItemDetails(ctx, queueID); buildNumber > 0 {
+					result.BuildNumber = buildNumber
+					result.BuildURL = buildURL
+				}
+			}
+		} else {
+			// Likely a direct build URL
+			if bn := parseBuildNumberFromURL(loc); bn > 0 {
+				result.BuildNumber = bn
+				result.BuildURL = loc
 			}
 		}
 	}
@@ -433,37 +460,50 @@ func extractQueueID(queueURL string) string {
 func (opts *JenkinsOptions) getQueueItemDetails(ctx context.Context, queueID string) (int, string) {
 	apiPath := "/queue/item/" + queueID + "/api/json"
 
-	// Retry up to 8 times with 1s delay to wait for build to start (quiet period + executor assignment)
-	for i := 0; i < 8; i++ {
-		if i > 0 {
-			time.Sleep(1 * time.Second)
+	// Poll up to 60s with arithmetic backoff 1s, 2s, ...
+	start := time.Now()
+	attempt := 0
+	for {
+		// Check overall time budget
+		if time.Since(start) >= 60*time.Second {
+			break
 		}
 
 		resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiPath, nil, nil)
-		if err != nil {
-			continue
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				var queueItem struct {
+					ID         int `json:"id"`
+					Executable struct {
+						Number int    `json:"number"`
+						URL    string `json:"url"`
+					} `json:"executable"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&queueItem); err == nil {
+					resp.Body.Close()
+					if queueItem.Executable.Number > 0 {
+						return queueItem.Executable.Number, queueItem.Executable.URL
+					}
+				} else {
+					resp.Body.Close()
+				}
+			} else {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != 200 {
-			continue
+		attempt++
+		// Compute next sleep using arithmetic backoff
+		next := time.Duration(attempt) * time.Second
+		remaining := 60*time.Second - time.Since(start)
+		if remaining <= 0 {
+			break
 		}
-
-		var queueItem struct {
-			ID         int `json:"id"`
-			Executable struct {
-				Number int    `json:"number"`
-				URL    string `json:"url"`
-			} `json:"executable"`
+		if next > remaining {
+			next = remaining
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&queueItem); err != nil {
-			continue
-		}
-
-		// If we got a build number, return it
-		if queueItem.Executable.Number > 0 {
-			return queueItem.Executable.Number, queueItem.Executable.URL
-		}
+		time.Sleep(next)
 	}
 
 	return 0, ""
@@ -733,6 +773,15 @@ func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (
 		return recentBuilds[i].Number > recentBuilds[j].Number
 	})
 
+	// Include queued builds that match this job (by URL prefix)
+	if queuedAll, err := opts.getQueuedBuilds(ctx); err == nil {
+		for _, qb := range queuedAll {
+			if strings.HasPrefix(qb.URL, jenkinsJob.URL) {
+				jenkinsJob.QueuedBuilds = append(jenkinsJob.QueuedBuilds, qb)
+			}
+		}
+	}
+
 	return jenkinsJob, nil
 }
 
@@ -867,6 +916,55 @@ func (opts *JenkinsOptions) getRunningBuilds(ctx context.Context) ([]RunningBuil
 	}
 
 	return runningBuilds, nil
+}
+
+// getQueuedBuilds fetches queued builds from Jenkins queue API
+func (opts *JenkinsOptions) getQueuedBuilds(ctx context.Context) ([]QueuedBuild, error) {
+	client := opts.Client
+	resp, err := opts.callJenkins(ctx, client, http.MethodGet, "/queue/api/json?tree=items[id,task[name,url],why,inQueueSince,stuck,buildable,params]", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("jenkins api returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var queueResp struct {
+		Items []struct {
+			ID   int `json:"id"`
+			Task struct {
+				Name string `json:"name"`
+				URL  string `json:"url"`
+			} `json:"task"`
+			Why          string `json:"why"`
+			InQueueSince int64  `json:"inQueueSince"`
+			Stuck        bool   `json:"stuck"`
+			Buildable    bool   `json:"buildable"`
+			Params       string `json:"params"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&queueResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	queued := make([]QueuedBuild, 0, len(queueResp.Items))
+	for _, it := range queueResp.Items {
+		qb := QueuedBuild{
+			JobName:     it.Task.Name,
+			URL:         it.Task.URL,
+			QueueID:     it.ID,
+			Why:         it.Why,
+			QueuedSince: TimeMS(time.Unix(0, it.InQueueSince*int64(time.Millisecond))),
+			Stuck:       it.Stuck,
+			Buildable:   it.Buildable,
+			Parameters:  strings.TrimSpace(it.Params),
+		}
+		queued = append(queued, qb)
+	}
+	return queued, nil
 }
 
 // waitForRunningBuild waits for a Jenkins build to complete or timeout
@@ -1116,7 +1214,7 @@ func (t *TimeMS) UnmarshalJSON(b []byte) error {
 	var ms int64
 	if err := json.Unmarshal(b, &ms); err == nil {
 		sec := ms / 1000
-		nsec := (ms % 1000) * int64(time.Microsecond)
+		nsec := (ms % 1000) * int64(time.Millisecond)
 		*t = TimeMS(time.Unix(sec, nsec))
 		return nil
 	}
@@ -1137,7 +1235,7 @@ func (t *TimeMS) UnmarshalJSON(b []byte) error {
 		}
 		if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
 			sec := ms / 1000
-			nsec := (ms % 1000) * int64(time.Microsecond)
+			nsec := (ms % 1000) * int64(time.Millisecond)
 			*t = TimeMS(time.Unix(sec, nsec))
 			return nil
 		}

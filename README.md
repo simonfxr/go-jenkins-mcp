@@ -11,14 +11,16 @@
   - Returns: JSON array of jobs with basic information: `name`, `url`, `color`, `buildable`, `description`, and `lastBuild` when available
 
 - Tool: `jenkins_get_job`
-  - Description: Get detailed information about a specific Jenkins job by name, including the last 10 builds
+  - Description: Get detailed information about a specific Jenkins job by name, including the last 10 builds and any queued items for this job
   - Arguments: `name` (required) - Name of the Jenkins job
-  - Returns: JSON object with detailed job information including recent build history
+  - Returns: JSON object with detailed job information including recent build history and `queuedBuilds` (if present)
 
 - Tool: `jenkins_get_running_builds`
-  - Description: Get list of currently running Jenkins builds
+  - Description: Get list of currently running and queued Jenkins builds
   - Arguments: None
-  - Returns: JSON array of running builds with fields: `jobName`, `buildNumber`, `url`, `startTime` (RFC3339 string), `duration` (human-readable), and optional `progress`
+  - Returns: JSON object with:
+    - `builds`: running builds with fields: `jobName`, `buildNumber`, `url`, `startTime` (RFC3339 string), `duration` (human-readable), optional `progress`
+    - `queuedBuilds`: queued items with fields: `jobName`, `url`, `queueId`, `why`, `queuedSince` (RFC3339 string), `stuck`, `buildable`, optional `parameters`
 
 - Tool: `jenkins_get_build_logs`
   - Description: Get build logs for a specific Jenkins job and build number with pagination support
@@ -112,6 +114,21 @@ Each running build returned by `jenkins_get_running_builds` includes:
   "startTime": "2023-08-21T12:01:40Z",
   "duration": "45s",
   "progress": 75
+}
+```
+
+**Queued Build Format**
+Each queued build item includes:
+```json
+{
+  "jobName": "job-name",
+  "url": "https://jenkins.example.com/job/job-name/",
+  "queueId": 19069,
+  "why": "Build is waiting for an available executor",
+  "queuedSince": "2023-08-21T12:01:00Z",
+  "stuck": false,
+  "buildable": true,
+  "parameters": "PARAM1=foo\nPARAM2=bar"
 }
 ```
 
