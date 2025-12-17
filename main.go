@@ -1082,7 +1082,9 @@ func parseBuildNumberFromURL(u string) int {
 
 func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
 	t.InputSchema = jsonschemaForExt[In]()
-	mcp.AddTool(s, t, h)
+	mcp.AddTool(s, t, func(ctx context.Context, request *mcp.CallToolRequest, input In) (*mcp.CallToolResult, any, error) {
+		return h(ctx, request, input)
+	})
 }
 
 func structuredResult[Out any](out Out) (*mcp.CallToolResult, Out, error) {
