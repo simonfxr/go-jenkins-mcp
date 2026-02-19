@@ -100,6 +100,19 @@ type WaitForRunningBuildToolResponse struct {
 	TimedOut    bool       `json:"timedOut"` // Whether the wait operation timed out
 }
 
+// StopBuildToolArgs are the tool arguments for jenkins_stop_build.
+type StopBuildToolArgs struct {
+	JobName     string `json:"job_name" jsonschema:"Name/path of the Jenkins job (supports folders)"`
+	BuildNumber int    `json:"build_number" jsonschema:"Build number to stop"`
+}
+
+// StopBuildToolResponse represents the response from jenkins_stop_build.
+type StopBuildToolResponse struct {
+	JobName     string `json:"jobName"`
+	BuildNumber int    `json:"buildNumber"`
+	Stopped     bool   `json:"stopped"`
+}
+
 // BuildLogs describes a slice of a Jenkins build log and related metadata.
 type BuildLogs struct {
 	JobName     string `json:"jobName"`
@@ -276,6 +289,23 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 			resObj, err := opts.startJob(ctx, args.JobName, args.Parameters)
 			if err != nil {
 				return nil, StartJobToolResponse{}, err
+			}
+			return structuredResult(*resObj)
+		})
+
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_stop_build",
+		Description: "Stop a running Jenkins build by job name and build number"},
+		func(ctx context.Context, req *mcp.CallToolRequest, args StopBuildToolArgs) (*mcp.CallToolResult, StopBuildToolResponse, error) {
+			if strings.TrimSpace(args.JobName) == "" {
+				return nil, StopBuildToolResponse{}, fmt.Errorf("missing required argument: job_name")
+			}
+			if args.BuildNumber <= 0 {
+				return nil, StopBuildToolResponse{}, fmt.Errorf("missing or invalid required argument: build_number (must be > 0)")
+			}
+			resObj, err := opts.stopBuild(ctx, args.JobName, args.BuildNumber)
+			if err != nil {
+				return nil, StopBuildToolResponse{}, err
 			}
 			return structuredResult(*resObj)
 		})
@@ -507,6 +537,38 @@ func (opts *JenkinsOptions) getQueueItemDetails(ctx context.Context, queueID str
 	}
 
 	return 0, ""
+}
+
+// stopBuild stops a running Jenkins build.
+func (opts *JenkinsOptions) stopBuild(ctx context.Context, jobName string, buildNumber int) (*StopBuildToolResponse, error) {
+	jobPath := buildJobPath(jobName)
+	apiPath := fmt.Sprintf("%s/%d/stop", jobPath, buildNumber)
+
+	headers := map[string]string{}
+	if f, c, ok, _ := opts.getCrumb(ctx); ok {
+		headers[f] = c
+	}
+
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodPost, apiPath, nil, headers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stop build: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("job '%s' build #%d not found", jobName, buildNumber)
+	}
+	// Jenkins returns 302 on successful stop
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("jenkins api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	return &StopBuildToolResponse{
+		JobName:     jobName,
+		BuildNumber: buildNumber,
+		Stopped:     true,
+	}, nil
 }
 
 // getBuildLogTail fetches the tail of build logs from jenkins api
