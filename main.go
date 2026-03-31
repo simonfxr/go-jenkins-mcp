@@ -30,7 +30,8 @@ type GetJobsToolResponse struct {
 
 // GetJobToolArgs are the tool arguments for jenkins_get_job.
 type GetJobToolArgs struct {
-	Name string `json:"name" jsonschema:"Name of the Jenkins job to retrieve"`
+	Name      string `json:"name" jsonschema:"Name of the Jenkins job to retrieve"`
+	MaxBuilds int    `json:"max_builds,omitempty" jsonschema:"Maximum number of recent builds to return (default: 20)" default:"20"`
 }
 
 // GetJobToolResponse is the detailed job information returned by jenkins_get_job.
@@ -106,6 +107,21 @@ type StopBuildToolArgs struct {
 	BuildNumber int    `json:"build_number" jsonschema:"Build number to stop"`
 }
 
+// SearchBuildsToolArgs are the tool arguments for jenkins_search_builds.
+type SearchBuildsToolArgs struct {
+	JobName     string   `json:"job_name" jsonschema:"Name of the Jenkins job"`
+	Result      string   `json:"result,omitempty" jsonschema:"Filter by build result: SUCCESS, FAILURE, ABORTED"`
+	Params      []string `json:"params,omitempty" jsonschema:"Filter by build parameters as key=value pairs. Empty value (key=) matches empty/unset parameter."`
+	Limit       int      `json:"limit,omitempty" jsonschema:"Maximum number of matching results to return (default: 5)" default:"5"`
+	MaxLookback int      `json:"max_lookback,omitempty" jsonschema:"Maximum number of builds to scan (default: 100)" default:"100"`
+}
+
+// SearchBuildsToolResponse is the result payload for jenkins_search_builds.
+type SearchBuildsToolResponse struct {
+	Builds  []Build `json:"builds"`
+	Scanned int     `json:"scanned"` // how many builds were scanned
+}
+
 // StopBuildToolResponse represents the response from jenkins_stop_build.
 type StopBuildToolResponse struct {
 	JobName     string `json:"jobName"`
@@ -158,14 +174,15 @@ type BuildParameter struct {
 
 // Build represents a Jenkins build
 type Build struct {
-	Number            int        `json:"number"`
-	URL               string     `json:"url"`
-	Building          bool       `json:"building"`
-	Result            string     `json:"result"`            // SUCCESS, FAILURE, UNSTABLE, ABORTED, null if building
-	Timestamp         TimeMS     `json:"timestamp"`         // RFC3339 timestamp
-	Duration          DurationMS `json:"duration"`          // Human-readable in output, parses from ms
-	EstimatedDuration DurationMS `json:"estimatedDuration"` // Human-readable in output, parses from ms
-	DisplayName       string     `json:"displayName"`
+	Number            int               `json:"number"`
+	URL               string            `json:"url"`
+	Building          bool              `json:"building"`
+	Result            string            `json:"result"`            // SUCCESS, FAILURE, UNSTABLE, ABORTED, null if building
+	Timestamp         TimeMS            `json:"timestamp"`         // RFC3339 timestamp
+	Duration          DurationMS        `json:"duration"`          // Human-readable in output, parses from ms
+	EstimatedDuration DurationMS        `json:"estimatedDuration"` // Human-readable in output, parses from ms
+	DisplayName       string            `json:"displayName"`
+	Parameters        map[string]string `json:"parameters,omitempty"` // Build parameters (name -> value)
 }
 
 // QueuedBuild represents a queued Jenkins build item
@@ -209,7 +226,10 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 			if strings.TrimSpace(args.Name) == "" {
 				return nil, Job{}, fmt.Errorf("missing required argument: name")
 			}
-			job, err := opts.getJenkinsJob(ctx, args.Name)
+			if args.MaxBuilds <= 0 {
+				args.MaxBuilds = 20
+			}
+			job, err := opts.getJenkinsJob(ctx, args.Name, args.MaxBuilds)
 			if err != nil {
 				return nil, Job{}, err
 			}
@@ -291,6 +311,26 @@ func (opts *JenkinsOptions) addTools(s *mcp.Server) {
 				return nil, StartJobToolResponse{}, err
 			}
 			return structuredResult(*resObj)
+		})
+
+	addTool(s, &mcp.Tool{
+		Name:        "jenkins_search_builds",
+		Description: "Search Jenkins builds by result and/or build parameters. Use to find e.g. the latest successful ARM build or a build without a specific feature branch."},
+		func(ctx context.Context, req *mcp.CallToolRequest, args SearchBuildsToolArgs) (*mcp.CallToolResult, SearchBuildsToolResponse, error) {
+			if strings.TrimSpace(args.JobName) == "" {
+				return nil, SearchBuildsToolResponse{}, fmt.Errorf("missing required argument: job_name")
+			}
+			if args.Limit <= 0 {
+				args.Limit = 5
+			}
+			if args.MaxLookback <= 0 {
+				args.MaxLookback = 100
+			}
+			res, err := opts.searchBuilds(ctx, args)
+			if err != nil {
+				return nil, SearchBuildsToolResponse{}, err
+			}
+			return structuredResult(*res)
 		})
 
 	addTool(s, &mcp.Tool{
@@ -736,8 +776,32 @@ func (opts *JenkinsOptions) getBuildLogs(ctx context.Context, jobName string, bu
 	}, nil
 }
 
+// buildAction represents a Jenkins build action (used to extract parameters).
+type buildAction struct {
+	Class      string `json:"_class"`
+	Parameters []struct {
+		Name  string `json:"name"`
+		Value any    `json:"value"`
+	} `json:"parameters"`
+}
+
+// extractBuildParams extracts build parameters from Jenkins actions.
+func extractBuildParams(actions []buildAction) map[string]string {
+	for _, a := range actions {
+		if a.Class != "hudson.model.ParametersAction" || len(a.Parameters) == 0 {
+			continue
+		}
+		params := make(map[string]string, len(a.Parameters))
+		for _, p := range a.Parameters {
+			params[p.Name] = fmt.Sprint(p.Value)
+		}
+		return params
+	}
+	return nil
+}
+
 // getJenkinsJob fetches a specific job from jenkins api by name
-func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (*Job, error) {
+func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string, maxBuilds int) (*Job, error) {
 	client := opts.Client
 
 	// Build Jenkins job path for nested jobs/folders
@@ -747,11 +811,13 @@ func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (
 	apiPath := jobPath + "/api/json?tree=" +
 		"name,url,color,buildable,description," +
 		"lastBuild[" +
-		"number,url,building,result,timestamp,duration,estimatedDuration,displayName" +
+		"number,url,building,result,timestamp,duration,estimatedDuration,displayName," +
+		"actions[_class,parameters[name,value]]" +
 		"]," +
 		"builds[" +
-		"number,url,building,result,timestamp,duration,estimatedDuration,displayName" +
-		"]{0,10}," +
+		"number,url,building,result,timestamp,duration,estimatedDuration,displayName," +
+		"actions[_class,parameters[name,value]]" +
+		"]{0," + strconv.Itoa(maxBuilds) + "}," +
 		"property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]"
 	resp, err := opts.callJenkins(ctx, client, http.MethodGet, apiPath, nil, nil)
 	if err != nil {
@@ -770,14 +836,20 @@ func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (
 
 	// Parse response
 	var jobData struct {
-		Name        string  `json:"name"`
-		URL         string  `json:"url"`
-		Color       string  `json:"color"`
-		Buildable   bool    `json:"buildable"`
-		Description string  `json:"description"`
-		LastBuild   *Build  `json:"lastBuild"`
-		Builds      []Build `json:"builds"`
-		Property    []struct {
+		Name        string `json:"name"`
+		URL         string `json:"url"`
+		Color       string `json:"color"`
+		Buildable   bool   `json:"buildable"`
+		Description string `json:"description"`
+		LastBuild   *struct {
+			Build
+			Actions []buildAction `json:"actions"`
+		} `json:"lastBuild"`
+		Builds []struct {
+			Build
+			Actions []buildAction `json:"actions"`
+		} `json:"builds"`
+		Property []struct {
 			ParameterDefinitions []struct {
 				Name                  string `json:"name"`
 				Type                  string `json:"type"`
@@ -796,17 +868,25 @@ func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (
 
 	// Convert builds to our format
 	recentBuilds := make([]Build, len(jobData.Builds))
-	for i, buildData := range jobData.Builds {
-		recentBuilds[i] = Build(buildData)
+	for i, b := range jobData.Builds {
+		recentBuilds[i] = b.Build
+		recentBuilds[i].Parameters = extractBuildParams(b.Actions)
 	}
 
 	// Convert to our format
+	var lastBuild *Build
+	if jobData.LastBuild != nil {
+		lb := jobData.LastBuild.Build
+		lb.Parameters = extractBuildParams(jobData.LastBuild.Actions)
+		lastBuild = &lb
+	}
 	jenkinsJob := &Job{
 		Name:         jobData.Name,
 		URL:          jobData.URL,
 		Color:        jobData.Color,
 		Buildable:    jobData.Buildable,
 		Description:  jobData.Description,
+		LastBuild:    lastBuild,
 		RecentBuilds: recentBuilds,
 		Parameters:   []BuildParameter{},
 	}
@@ -845,6 +925,82 @@ func (opts *JenkinsOptions) getJenkinsJob(ctx context.Context, jobName string) (
 	}
 
 	return jenkinsJob, nil
+}
+
+// searchBuilds fetches builds from Jenkins and filters by result and parameters.
+func (opts *JenkinsOptions) searchBuilds(ctx context.Context, args SearchBuildsToolArgs) (*SearchBuildsToolResponse, error) {
+	jobPath := buildJobPath(args.JobName)
+
+	apiPath := jobPath + "/api/json?tree=" +
+		"builds[" +
+		"number,url,building,result,timestamp,duration,estimatedDuration,displayName," +
+		"actions[_class,parameters[name,value]]" +
+		"]{0," + strconv.Itoa(args.MaxLookback) + "}"
+
+	resp, err := opts.callJenkins(ctx, opts.Client, http.MethodGet, apiPath, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("job '%s' not found", args.JobName)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("jenkins api returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		Builds []struct {
+			Build
+			Actions []buildAction `json:"actions"`
+		} `json:"builds"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Parse param filters
+	type paramFilter struct {
+		key   string
+		value string
+	}
+	var filters []paramFilter
+	for _, p := range args.Params {
+		k, v, _ := strings.Cut(p, "=")
+		filters = append(filters, paramFilter{k, v})
+	}
+
+	var matched []Build
+	for _, b := range data.Builds {
+		if args.Result != "" && b.Result != args.Result {
+			continue
+		}
+		params := extractBuildParams(b.Actions)
+		skip := false
+		for _, f := range filters {
+			got := params[f.key]
+			if got != f.value {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		build := b.Build
+		build.Parameters = params
+		matched = append(matched, build)
+		if len(matched) >= args.Limit {
+			break
+		}
+	}
+
+	return &SearchBuildsToolResponse{
+		Builds:  matched,
+		Scanned: len(data.Builds),
+	}, nil
 }
 
 // getJenkinsJobs fetches jobs from jenkins api
