@@ -6,15 +6,13 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"unsafe"
 
 	"github.com/google/jsonschema-go/jsonschema"
-	"golang.org/x/exp/constraints"
 )
 
 // jsonschemaForExt builds a JSON Schema for T using the base generator
-// and enriches it with descriptions from `mcp` struct tags and defaults
-// from `default` struct tags.
+// (which picks up descriptions from `jsonschema` struct tags) and enriches it
+// with defaults from `default` struct tags.
 func jsonschemaForExt[T any]() *jsonschema.Schema {
 	sch, err := jsonschema.For[T](nil)
 	if err != nil {
@@ -34,8 +32,7 @@ func jsonschemaForExt[T any]() *jsonschema.Schema {
 		sch.Properties = make(map[string]*jsonschema.Schema)
 	}
 
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
+	for f := range t.Fields() {
 		if f.PkgPath != "" { // unexported
 			continue
 		}
@@ -43,13 +40,7 @@ func jsonschemaForExt[T any]() *jsonschema.Schema {
 		if jsonTag == "-" {
 			continue
 		}
-		name := jsonTag
-		if name == "" {
-			name = f.Name
-		}
-		if comma := strings.IndexByte(name, ','); comma >= 0 {
-			name = name[:comma]
-		}
+		name, _, _ := strings.Cut(jsonTag, ",")
 		if name == "" {
 			name = f.Name
 		}
@@ -62,87 +53,44 @@ func jsonschemaForExt[T any]() *jsonschema.Schema {
 		}
 
 		if def := f.Tag.Get("default"); def != "" {
-			typ := f.Type
-			if typ.Kind() == reflect.Ptr {
-				typ = typ.Elem()
-			}
-			switch reflect.Zero(typ).Interface().(type) {
-			case int:
-				p.Default = parseSigned[int](def)
-			case int8:
-				p.Default = parseSigned[int8](def)
-			case int16:
-				p.Default = parseSigned[int16](def)
-			case int32:
-				p.Default = parseSigned[int32](def)
-			case int64:
-				p.Default = parseSigned[int64](def)
-			case uint:
-				p.Default = parseUnsigned[uint](def)
-			case uintptr:
-				p.Default = parseUnsigned[uintptr](def)
-			case uint8:
-				p.Default = parseUnsigned[uint8](def)
-			case uint16:
-				p.Default = parseUnsigned[uint16](def)
-			case uint32:
-				p.Default = parseUnsigned[uint32](def)
-			case uint64:
-				p.Default = parseUnsigned[uint64](def)
-			case float32:
-				p.Default = parseFloat[float32](def)
-			case float64:
-				p.Default = parseFloat[float64](def)
-			case string:
-				bs, err := json.Marshal(def)
-				if err != nil {
-					panic(err) // unreachable
-				}
-				p.Default = json.RawMessage(bs)
-			default:
-				panic(fmt.Errorf("unsupported type %s for default value", f.Type))
-			}
+			p.Default = parseDefault(f.Type, def)
 		}
 	}
 
 	return sch
 }
 
-func parseSigned[T constraints.Signed](x string) json.RawMessage {
-	v, err := strconv.ParseInt(x, 10, int(unsafe.Sizeof(T(0))*8))
-	if err != nil {
-		panic(fmt.Errorf("failed to parse %s as %T: %w", x, T(0), err))
+// parseDefault converts a `default` struct tag value into a JSON literal
+// matching the field type. It panics on unsupported types or malformed
+// values, since both indicate a programming error in the tool definitions.
+func parseDefault(typ reflect.Type, def string) json.RawMessage {
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
 	}
-	n := T(v)
-	bs, err := json.Marshal(n)
-	if err != nil {
-		panic(err) // unreachable
+	var (
+		v   any
+		err error
+	)
+	switch typ.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		v, err = strconv.ParseInt(def, 10, typ.Bits())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		v, err = strconv.ParseUint(def, 10, typ.Bits())
+	case reflect.Float32, reflect.Float64:
+		v, err = strconv.ParseFloat(def, typ.Bits())
+	case reflect.Bool:
+		v, err = strconv.ParseBool(def)
+	case reflect.String:
+		v = def
+	default:
+		panic(fmt.Errorf("unsupported type %s for default value", typ))
 	}
-	return json.RawMessage(bs)
-}
-
-func parseUnsigned[T constraints.Unsigned](x string) json.RawMessage {
-	v, err := strconv.ParseUint(x, 10, int(unsafe.Sizeof(T(0))*8))
 	if err != nil {
-		panic(fmt.Errorf("failed to parse %s as %T: %w", x, T(0), err))
+		panic(fmt.Errorf("failed to parse default %q as %s: %w", def, typ, err))
 	}
-	n := T(v)
-	bs, err := json.Marshal(n)
-	if err != nil {
-		panic(err) // unreachable
-	}
-	return json.RawMessage(bs)
-}
-
-func parseFloat[T constraints.Float](x string) json.RawMessage {
-	v, err := strconv.ParseFloat(x, int(unsafe.Sizeof(T(0))*8))
-	if err != nil {
-		panic(fmt.Errorf("failed to parse %s as %T: %w", x, T(0), err))
-	}
-	n := T(v)
-	bs, err := json.Marshal(n)
+	bs, err := json.Marshal(v)
 	if err != nil {
 		panic(err) // unreachable
 	}
-	return json.RawMessage(bs)
+	return bs
 }

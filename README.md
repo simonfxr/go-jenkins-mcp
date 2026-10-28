@@ -2,7 +2,7 @@
 
 **Overview**
 - Purpose: Pure Go MCP server exposing Jenkins API functionality as MCP tools.
-- Transport: stdio (newline-delimited JSON) via `mcp-go-sdk`.
+- Transport: stdio (newline-delimited JSON) or Streamable HTTP via the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
 
 **Features**
 - Tool: `jenkins_get_jobs`
@@ -172,12 +172,18 @@ Each queued build item includes:
 }
 ```
 
-**Build Logs Result**
-`jenkins_get_build_logs` returns plain text containing the requested portion of the log. Control pagination via the `offset` and `length` arguments. Example output:
-```
-Started by user admin
-Building in workspace /var/lib/jenkins/workspace/job-name
-...
+**Build Logs Format**
+`jenkins_get_build_logs` and `jenkins_get_build_log_tail` return the requested portion of the log together with pagination metadata. Control pagination via the `offset` and `length` arguments (or `max_length` for the tail). Example output:
+```json
+{
+  "jobName": "job-name",
+  "buildNumber": 124,
+  "offset": 0,
+  "length": 96,
+  "totalSize": 20480,
+  "hasMore": true,
+  "logs": "Started by user admin\nBuilding in workspace /var/lib/jenkins/workspace/job-name\n..."
+}
 ```
 
 **Wait for Build Format**
@@ -216,6 +222,7 @@ Status values:
 - CLI: `-auth "<user>:<api_token>"` (optional) - Jenkins authentication credentials
 - ENV: `JENKINS_MCP_AUTH="<user>:<api_token>"` (optional) - Alternative to `-auth` flag
 - CLI: `-stdio` (default true) for stdio, or `-http <addr>` for Streamable HTTP.
+- CLI: `-version` prints the version and exits.
 
 **Authentication**
 Authentication can be provided in two ways:
@@ -224,13 +231,15 @@ Authentication can be provided in two ways:
 
 If both are provided, the `-auth` flag takes precedence.
 
-**Run (stdio)**
-- Build: `go build -o jenkins-mcp-go .`
+**Install / Build**
+- Install: `go install github.com/simonfxr/go-jenkins-mcp@latest`
+- With Nix: `nix run github:simonfxr/go-jenkins-mcp -- -url ...` or `nix profile install github:simonfxr/go-jenkins-mcp`
+- Build from source: `go build` (produces `./go-jenkins-mcp`)
 - Run (stdio): execute with required parameters; an MCP host (e.g., Claude Desktop) should launch this binary with stdio wiring.
 
 Examples:
-- `JENKINS_MCP_AUTH="myuser:myapitoken" ./jenkins-mcp-go -url "https://jenkins.example.com"`
-- HTTP mode: `JENKINS_MCP_AUTH="myuser:myapitoken" ./jenkins-mcp-go -url "https://jenkins.example.com" -http :8080`
+- `JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com"`
+- HTTP mode: `JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com" -http :8080`
 
 **Smithery / Hosts**
 - Configure your MCP host to run this server over stdio with the required parameters.
@@ -261,8 +270,6 @@ Examples:
 - If `-stdio=false` and no `-http` is provided, the server exits with an error.
 
 **TODO**
-- Add more Jenkins tools (get build status, etc.)
-- Add filtering options (by job name pattern, status, etc.)
+- Add filtering options for `jenkins_get_jobs` (by job name pattern, status, etc.)
 - Add SSL certificate validation options
-- Optionally return structured metadata for log tools
 - Optional `wait` behavior modes for `jenkins_start_job`

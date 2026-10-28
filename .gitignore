@@ -3,3 +3,5 @@
 
 *.local.env
 *.log
+/result
+/result-*
