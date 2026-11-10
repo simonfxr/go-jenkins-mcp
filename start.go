@@ -75,10 +75,8 @@ func buildStartParams(info *jobStartInfo, base map[string]string, params map[str
 		d, ok := defs[name]
 		if !ok {
 			hint := ""
-			for _, n := range names {
-				if strings.EqualFold(n, name) {
-					hint = fmt.Sprintf(" (did you mean %q?)", n)
-				}
+			if n := closestName(name, names); n != "" {
+				hint = fmt.Sprintf(" (did you mean %q?)", n)
 			}
 			return nil, fmt.Errorf("unknown parameter %q for job %q%s; valid parameters: %s", name, info.Name, hint, strings.Join(names, ", "))
 		}
@@ -99,6 +97,41 @@ func buildStartParams(info *jobStartInfo, base map[string]string, params map[str
 		out[name] = v
 	}
 	return out, nil
+}
+
+// closestName returns the candidate most similar to name (ignoring case), if
+// it is close enough to be a plausible typo: a difference in case only, or up
+// to two edits for longer names.
+func closestName(name string, candidates []string) string {
+	best, bestDist := "", min(2, len(name)/4)+1
+	for _, c := range candidates {
+		if d := editDistance(strings.ToLower(name), strings.ToLower(c)); d < bestDist {
+			best, bestDist = c, d
+		}
+	}
+	return best
+}
+
+// editDistance is the Levenshtein distance between a and b.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(rb)]
 }
 
 // checkParamValue validates a value against a choice or boolean definition.

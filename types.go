@@ -144,11 +144,14 @@ func (d *DurationMS) UnmarshalJSON(b []byte) error {
 }
 
 // MarshalJSON encodes DurationMS as a human-readable string (e.g., "5m10s").
-// Durations of a second or more are rounded to whole seconds.
+// Durations of a second or more are rounded to whole seconds, shorter ones
+// to milliseconds.
 func (d DurationMS) MarshalJSON() ([]byte, error) {
 	dur := time.Duration(d)
 	if dur >= time.Second {
 		dur = dur.Round(time.Second)
+	} else {
+		dur = dur.Round(time.Millisecond)
 	}
 	return json.Marshal(dur.String())
 }

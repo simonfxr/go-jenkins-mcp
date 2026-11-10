@@ -156,7 +156,8 @@ func TestStartJobValidatesParameters(t *testing.T) {
 		params map[string]any
 		want   string
 	}{
-		{map[string]any{"BRANCHH": "x"}, `unknown parameter "BRANCHH"`},
+		{map[string]any{"BRANCHH": "x"}, `unknown parameter "BRANCHH" for job "build" (did you mean "BRANCH"?); valid parameters: BRANCH, TARGET, WIPE`},
+		{map[string]any{"SOMETHING_ELSE": "x"}, `unknown parameter "SOMETHING_ELSE" for job "build"; valid parameters`},
 		{map[string]any{"branch": "x"}, `did you mean "BRANCH"`},
 		{map[string]any{"TARGET": "x86"}, "valid choices: all, arm"},
 		{map[string]any{"WIPE": "maybe"}, "use true or false"},

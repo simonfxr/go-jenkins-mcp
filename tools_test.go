@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -236,6 +237,18 @@ func TestGetBuildDetails(t *testing.T) {
 	}
 	if strings.Contains(string(out), "estimatedDuration") || strings.Contains(string(out), "artifactCount") {
 		t.Errorf("unknown estimate and complete artifact count should be omitted: %s", out)
+	}
+}
+
+func TestDurationFormatting(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		112904406 * time.Nanosecond: `"113ms"`,
+		586038 * time.Millisecond:   `"9m46s"`,
+		0:                           `"0s"`,
+	} {
+		if got, _ := json.Marshal(DurationMS(d)); string(got) != want {
+			t.Errorf("%v marshals to %s, want %s", d, got, want)
+		}
 	}
 }
 

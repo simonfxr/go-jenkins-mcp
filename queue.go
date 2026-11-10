@@ -132,7 +132,6 @@ func (opts *JenkinsOptions) getQueuedBuilds(ctx context.Context) ([]QueuedBuild,
 func (opts *JenkinsOptions) waitForQueueItem(ctx context.Context, queueID int, jobName string, timeout time.Duration, progress progressFunc) (*WaitForQueueItemToolResponse, error) {
 	start := time.Now()
 	deadline := start.Add(timeout)
-	interval := min(opts.PollInterval, time.Second)
 	failures := 0
 	var last *QueueItem
 	for {
@@ -158,12 +157,17 @@ func (opts *JenkinsOptions) waitForQueueItem(ctx context.Context, queueID int, j
 		if remaining <= 0 {
 			return &WaitForQueueItemToolResponse{QueueItem: last, Status: "queued", TimedOut: true, WaitTime: DurationMS(time.Since(start))}, nil
 		}
+		// Builds usually leave the queue right after the quiet period, so poll
+		// quickly at first; long waits (no free executor) back off.
+		interval := min(opts.PollInterval, time.Second)
+		if time.Since(start) > 20*time.Second {
+			interval = opts.PollInterval
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(min(interval, remaining)):
 		}
-		interval = min(interval*2, opts.PollInterval)
 	}
 }
 
