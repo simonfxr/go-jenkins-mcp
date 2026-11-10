@@ -17,7 +17,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
         pname = "go-jenkins-mcp";
-        version = "0.1.0" + (if self ? shortRev then "+${self.shortRev}" else "");
+        version = "0.2.0" + (if self ? shortRev then "+${self.shortRev}" else "");
         fs = pkgs.lib.fileset;
         src = fs.toSource {
           root = ./.;
