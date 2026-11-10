@@ -1,275 +1,230 @@
 # Jenkins MCP Server (Go)
 
-**Overview**
-- Purpose: Pure Go MCP server exposing Jenkins API functionality as MCP tools.
-- Transport: stdio (newline-delimited JSON) or Streamable HTTP via the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
+Pure Go [MCP](https://modelcontextprotocol.io) server that lets coding agents drive Jenkins: trigger builds, wait for them, and find out why they failed without wading through raw console output.
 
-**Features**
-- Tool: `jenkins_get_jobs`
-  - Description: Get list of Jenkins jobs with their current status
-  - Arguments: None
-  - Returns: JSON array of jobs with basic information: `name`, `url`, `color`, `buildable`, `description`, and `lastBuild` when available
+- Transport: stdio or Streamable HTTP, via the official [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk).
+- Works with freestyle and Pipeline jobs, folders included.
 
-- Tool: `jenkins_get_job`
-  - Description: Get detailed information about a specific Jenkins job by name, including recent builds and any queued items for this job
-  - Arguments:
-    - `name` (required) - Name of the Jenkins job
-    - `max_builds` (optional, default: 20) - Maximum number of recent builds to return
-  - Returns: JSON object with detailed job information including recent build history and `queuedBuilds` (if present)
+## Tools
 
-- Tool: `jenkins_get_running_builds`
-  - Description: Get list of currently running and queued Jenkins builds
-  - Arguments: None
-  - Returns: JSON object with:
-    - `builds`: running builds with fields: `jobName`, `buildNumber`, `url`, `startTime` (RFC3339 string), `duration` (human-readable), optional `progress`
-    - `queuedBuilds`: queued items with fields: `jobName`, `url`, `queueId`, `why`, `queuedSince` (RFC3339 string), `stuck`, `buildable`, optional `parameters`
+Builds are addressed by `job_name` plus `build_number`. Wherever a build is expected you can instead pass
 
-- Tool: `jenkins_get_build`
-  - Description: Get detailed information about a specific Jenkins build by job name and build number
-  - Arguments:
-    - `job_name` (required) - Name/path of the Jenkins job (supports folders)
-    - `build_number` (required) - Build number
-  - Returns: JSON object with build details including `result`, `building`, timestamps, durations, display name, and extracted build `parameters`
+- `build`: `lastBuild`, `lastCompletedBuild`, `lastSuccessfulBuild`, `lastFailedBuild` or `lastUnsuccessfulBuild`
+- a pasted Jenkins URL as `job_name`, e.g. `https://jenkins.example.com/job/folder/job/app/123/console`
 
-- Tool: `jenkins_get_build_logs`
-  - Description: Get build logs for a specific Jenkins job and build number with pagination support
-  - Arguments: 
-    - `job_name` (required) - Name of the Jenkins job
-    - `build_number` (required) - Build number to get logs for
-    - `offset` (optional, default: 0) - Starting byte offset in the log file
-    - `length` (optional, default: 8192) - Maximum number of bytes to retrieve
-  - Returns: JSON object with log metadata: `jobName`, `buildNumber`, `offset`, `length`, `totalSize`, `hasMore`, and `logs`
+Responses always carry the resolved `jobName` and `buildNumber`.
 
-- Tool: `jenkins_get_build_log_tail`
-  - Description: Get the tail of build logs - useful for quick failure analysis
-  - Arguments:
-    - `job_name` (required) - Name of the Jenkins job
-    - `build_number` (required) - Build number to get logs for
-    - `max_length` (optional, default: 8192) - Maximum number of bytes to retrieve from the end
-  - Returns: JSON object with log metadata: `jobName`, `buildNumber`, `offset`, `length`, `totalSize`, `hasMore`, and `logs`
+| Tool | Purpose |
+|------|---------|
+| `jenkins_get_jobs` | List jobs (descends into folders), optional `folder` and `filter` |
+| `jenkins_get_job` | Parameter definitions, recent builds, queued builds |
+| `jenkins_search_builds` | Find builds by result and parameters |
+| `jenkins_get_build` | Build details: state, parameters, causes, node, changes, artifacts |
+| `jenkins_get_build_stages` | Pipeline stages; failed steps with error and step log |
+| `jenkins_get_build_logs` | Read the log by byte offset or line number |
+| `jenkins_get_build_log_tail` | Read the end of the log |
+| `jenkins_grep_build_log` | Regex search in the log; default pattern finds error lines |
+| `jenkins_download_build_log` | Write the whole log to a local file (or return it as plain text) |
+| `jenkins_download_artifact` | Save a build artifact to a local file |
+| `jenkins_get_running_builds` | Running and queued builds |
+| `jenkins_get_nodes` | Nodes with online state, labels, executor usage |
+| `jenkins_start_job` | Trigger a build with validated parameters, optionally wait |
+| `jenkins_stop_build` | Abort a running build or cancel a queued one |
+| `jenkins_get_queue_item` | State of a queue item |
+| `jenkins_wait_for_queue_item` | Wait until a queued build starts |
+| `jenkins_wait_for_running_build` | Wait until a build finishes; summarizes failures |
 
-- Tool: `jenkins_start_job`
-  - Description: Trigger a Jenkins job build with optional parameters
-  - Arguments:
-    - `job_name` (required) - Name/path of the Jenkins job (supports folders)
-    - `parameters` (optional) - Object map of build parameters
-  - Returns: JSON with `jobName` and `queueUrl` (if available), plus `queueId` when Jenkins returns a queue item. The server waits briefly for Jenkins to assign an executable and may also include `buildUrl` and `buildNumber`; total queue wait is bounded to 30 seconds.
+All read-only tools are annotated with `readOnlyHint` so hosts can auto-approve them.
 
-- Tool: `jenkins_get_queue_item`
-  - Description: Get the current state of a Jenkins queue item, including the assigned build when available
-  - Arguments:
-    - `queue_id` (required) - Jenkins queue item ID
-  - Returns: JSON object with queue item details including `jobName`, `why`, `queuedSince`, `cancelled`, and `executable` when a build has been assigned
+### Starting builds
 
-- Tool: `jenkins_wait_for_queue_item`
-  - Description: Wait for a Jenkins queue item to receive a build assignment, be cancelled, or timeout
-  - Arguments:
-    - `queue_id` (required) - Jenkins queue item ID
-    - `timeout_seconds` (optional, default: 30) - Maximum time to wait in seconds
-    - `poll_interval_seconds` (optional, default: 2) - Polling interval in seconds
-  - Returns: JSON object with `status` (`started`, `cancelled`, or `timeout`), `waitTime`, `timedOut`, latest `queueItem`, and `build` when assigned
+`jenkins_start_job`
 
-- Tool: `jenkins_wait_for_running_build`
-  - Description: Wait for a running Jenkins build to complete or timeout
-  - Arguments:
-    - `job_name` (required) - Name of the Jenkins job
-    - `build_number` (required) - Build number to wait for
-    - `timeout_seconds` (optional, default: 600) - Maximum time to wait in seconds
-  - Returns: JSON object with build completion status and timing information
+- `job_name` (required)
+- `parameters`: name/value map. Names and choice values are checked against the job's parameter definitions *before* anything is triggered - Jenkins itself silently ignores unknown names and would start a build with defaults. Omitted parameters use the job defaults.
+- `from_build`: re-run with the parameters of an earlier build; `parameters` override them.
+- `wait`: `none` (return once queued), `started` (default: wait for the build number), `completed` (wait for the result).
+- `timeout_seconds`: default 30 for `started`, 600 for `completed`. On timeout the current state is returned and the build keeps going.
 
-- Tool: `jenkins_search_builds`
-  - Description: Search Jenkins builds by result and/or build parameters
-  - Arguments:
-    - `job_name` (required) - Name of the Jenkins job
-    - `result` (optional) - Filter by build result: `SUCCESS`, `FAILURE`, `ABORTED`
-    - `params` (optional) - Filter by build parameters as `key=value` strings; an empty value (`key=`) matches an empty or unset parameter
-    - `limit` (optional, default: 5) - Maximum number of matching results to return
-    - `max_lookback` (optional, default: 100) - Maximum number of builds to scan
-  - Returns: JSON object with matching `builds` and `scanned` count
-
-- Tool: `jenkins_stop_build`
-  - Description: Stop a running Jenkins build by job name and build number
-  - Arguments:
-    - `job_name` (required) - Name/path of the Jenkins job (supports folders)
-    - `build_number` (required) - Build number to stop
-  - Returns: JSON object with `jobName`, `buildNumber`, and `stopped`
-
-**Job Format**
-Each job returned by `jenkins_get_jobs` and `jenkins_get_job` includes:
 ```json
 {
-  "name": "job-name",
-  "url": "https://jenkins.example.com/job/job-name/",
-  "color": "blue",
-  "buildable": true,
-  "description": "Job description",
-  "recentBuilds": [
-    {
-      "number": 123,
-      "url": "https://jenkins.example.com/job/job-name/123/",
-      "building": false,
-      "result": "SUCCESS",
-      "timestamp": "2023-08-21T12:00:00Z",
-      "duration": "2m0s"
-    },
-    {
-      "number": 122,
-      "url": "https://jenkins.example.com/job/job-name/122/",
-      "building": false,
-      "result": "SUCCESS",
-      "timestamp": "2023-08-21T11:40:00Z",
-      "duration": "1m58s"
-    }
-  ],
-  "parameters": [
-    {
-      "name": "MERGE_FEATURE",
-      "type": "StringParameterDefinition",
-      "description": "Feature branch to merge",
-      "defaultValue": "",
-      "choices": []
-    },
-    {
-      "name": "BUILD_TYPE",
-      "type": "ChoiceParameterDefinition",
-      "description": "Type of build to perform",
-      "defaultValue": "release",
-      "choices": ["debug", "release", "test"]
-    }
+  "jobName": "app",
+  "status": "started",
+  "queueId": 30617,
+  "buildNumber": 124,
+  "buildUrl": "https://jenkins.example.com/job/app/124/",
+  "parameters": {"BRANCH": "feature/x"}
+}
+```
+
+- `status`: `queued`, `started`, `completed` or `cancelled`. While `queued`, `why` holds Jenkins' reason.
+- `alreadyQueued: true`: an identical build was already waiting in the queue, so Jenkins added no new one; `queueId` refers to the existing item.
+- With `wait=completed`: `result`, `duration`, and `failure` (see below) when the build did not succeed.
+
+`jenkins_stop_build` takes `job_name` + `build_number`, or a `queue_id`. It reports what happened: `stopped`, `stopping` (abort requested, build still shutting down), `not_running`, or `cancelled_in_queue`. A `queue_id` whose build already started stops that build.
+
+`jenkins_get_queue_item` / `jenkins_wait_for_queue_item` take `queue_id` and optionally `job_name`. Jenkins forgets queue items five minutes after they leave the queue; with `job_name` the build is then found through its recorded queue ID.
+
+### Waiting
+
+`jenkins_wait_for_running_build` (`timeout_seconds`, default 600) returns immediately for finished builds and reports missing builds right away instead of waiting out the timeout.
+
+```json
+{
+  "jobName": "app",
+  "buildNumber": 124,
+  "status": "failure",
+  "result": "FAILURE",
+  "duration": "52s",
+  "waitTime": "41s",
+  "timedOut": false,
+  "failure": {
+    "failedStages": [{
+      "id": "13", "name": "build", "status": "FAILED", "duration": "50s",
+      "failedSteps": [{
+        "id": "26", "name": "Shell Script", "description": "make all", "status": "FAILED",
+        "error": "script returned exit code 2",
+        "log": "+ make all\nfoo.c:12: error: expected ';'\n"
+      }]
+    }]
+  }
+}
+```
+
+- `status`: `success`, `failure`, `unstable`, `aborted`, `not_built`, or `running` when the wait timed out (`timedOut: true`) - call again to keep waiting.
+- `failure`: for Pipeline builds the failed stages and steps; otherwise `errorLines` (last matches of the default error pattern) and `logTail`.
+- Clients that send a progress token receive progress notifications while waiting, which keeps long waits from hitting request timeouts.
+
+### Logs
+
+The server keeps a *cleaned* copy of each build log: Jenkins' hidden console annotations and ANSI escape sequences are removed, line endings are LF, and carriage-return progress output is collapsed to its final state. **Byte offsets and line numbers refer to this cleaned log and are identical across all log tools and the downloaded file.**
+
+All log tools return whole lines. Pipeline logs carry a `[2026-11-10T08:19:16.593Z] ` prefix on every line; it is dropped from tool output unless `timestamps: true` (the downloaded file always keeps it).
+
+`jenkins_get_build_logs`
+
+- `offset` (default 0) or `start_line` (1-based); reading starts at the beginning of the line containing `offset`
+- `length` (default 8192 bytes), `max_lines`
+
+```json
+{
+  "jobName": "app", "buildNumber": 124,
+  "offset": 20866, "nextOffset": 22047,
+  "startLine": 260, "endLine": 270,
+  "totalSize": 24856, "totalLines": 311,
+  "complete": true, "hasMore": true,
+  "logs": "..."
+}
+```
+
+Pass `nextOffset` as `offset` to continue. `complete` is false while the build is still running; then `hasMore` stays true and repeating the call with `nextOffset` follows the log.
+
+`jenkins_get_build_log_tail`: `max_length` (default 8192 bytes), `max_lines`. Same result shape. The end of a failed Pipeline log is often post-failure cleanup, so prefer the stages or grep tool to locate errors.
+
+`jenkins_grep_build_log`
+
+- `pattern`: RE2 regular expression. Default: a pattern for common error lines (`error`, `fatal`, `exception`, `failed`, `exit code N`, ...)
+- `exclude`: lines matching this regex are skipped
+- `ignore_case`, `context` (lines before/after, default 0), `max_matches` (default 20)
+- `tail`: return the last matches instead of the first
+- `offset`: start searching here; a truncated result returns `nextOffset` for the following matches
+
+```json
+{
+  "jobName": "app", "buildNumber": 124,
+  "totalMatches": 5, "truncated": true, "nextOffset": 24149,
+  "totalSize": 24856, "totalLines": 311, "complete": true,
+  "matches": [
+    {"line": 260, "offset": 20866, "text": "PHP Fatal error: Uncaught Exception: Merge failed",
+     "before": ["MERGING feature ..."], "after": ["CONFLICT (content): Merge conflict in bootstrap.sh"]}
   ]
 }
 ```
 
-Note: `recentBuilds` are sorted by build number (descending - most recent first) and both `lastBuild` and `recentBuilds` fields are omitted when empty.
+Use a match's `line` or `offset` as `start_line` / `offset` of `jenkins_get_build_logs` to read around it.
 
-Note: The `jenkins_get_job` tool returns individual jobs with full parameter information and recent build history (up to `max_builds`, default 20, sorted by number descending), while `jenkins_get_jobs` returns only basic job fields (no parameters or `recentBuilds`) for performance; it may include `lastBuild` when available.
+`jenkins_download_build_log`
 
-**Running Build Format**
-Each running build returned by `jenkins_get_running_builds` includes:
+- `output: "file"` (default) writes the full cleaned log and returns `path`, `size`, `lines`, `complete`. `path` chooses the destination; otherwise the log cache file is used.
+- `output: "text"` returns the entire log as plain text and nothing else, so tool output can be redirected straight into a file.
+
+Files are written on the machine running the server, so file output is only useful with the stdio transport or a local HTTP server.
+
+#### Log cache
+
+Logs of finished builds never change and are cached as plain files:
+
+1. `-cache-dir`, else `$JENKINS_MCP_CACHE_DIR`, else `<user cache dir>/go-jenkins-mcp` (`~/.cache/go-jenkins-mcp` on Linux)
+2. if that cannot be written (read-only home, sandbox): a private `go-jenkins-mcp-<uid>` directory below the temporary directory
+3. if that fails as well: memory only
+
+The cache is an optimization, never a requirement - every tool works in all three cases. `-cache-dir none` disables the disk cache. Cached logs older than 30 days are removed. Logs of running builds are held in memory and extended incrementally.
+
+### Pipeline stages
+
+`jenkins_get_build_stages` (`max_step_log_length`, default 4096) lists stages with status and duration. Stages that failed include their failing steps with the error message and the end of that step's own log - usually the shortest path to the cause of a failed Pipeline build. Works on running builds too. Requires the Pipeline Stage View plugin (`pipeline-rest-api`); for other builds it explains that no stage information exists.
+
+### Jobs and builds
+
+`jenkins_get_job` (`job_name`, `max_builds` default 10) returns parameter definitions and recent builds:
+
 ```json
 {
-  "jobName": "job-name",
-  "buildNumber": 124,
-  "url": "https://jenkins.example.com/job/job-name/124/",
-  "startTime": "2023-08-21T12:01:40Z",
-  "duration": "45s",
-  "progress": 75
-}
-```
-
-**Queued Build Format**
-Each queued build item includes:
-```json
-{
-  "jobName": "job-name",
-  "url": "https://jenkins.example.com/job/job-name/",
-  "queueId": 19069,
-  "why": "Build is waiting for an available executor",
-  "queuedSince": "2023-08-21T12:01:00Z",
-  "stuck": false,
+  "name": "app",
+  "url": "https://jenkins.example.com/job/app/",
+  "color": "blue",
   "buildable": true,
-  "parameters": "PARAM1=foo\nPARAM2=bar"
+  "recentBuilds": [
+    {"number": 124, "url": "...", "building": false, "result": "SUCCESS",
+     "timestamp": "2026-11-10T08:48:51Z", "duration": "6m51s", "estimatedDuration": "8m22s",
+     "nonDefaultParameters": {"BRANCH": "feature/x"}}
+  ],
+  "parameters": [
+    {"name": "BRANCH", "type": "StringParameterDefinition", "description": "Branch to build", "defaultValue": "main"},
+    {"name": "TARGET", "type": "ChoiceParameterDefinition", "defaultValue": "all", "choices": ["all", "arm"]}
+  ]
 }
 ```
 
-**Build Logs Format**
-`jenkins_get_build_logs` and `jenkins_get_build_log_tail` return the requested portion of the log together with pagination metadata. Control pagination via the `offset` and `length` arguments (or `max_length` for the tail). Example output:
-```json
-{
-  "jobName": "job-name",
-  "buildNumber": 124,
-  "offset": 0,
-  "length": 96,
-  "totalSize": 20480,
-  "hasMore": true,
-  "logs": "Started by user admin\nBuilding in workspace /var/lib/jenkins/workspace/job-name\n..."
-}
+Build listings (`jenkins_get_job`, `jenkins_search_builds`) show only `nonDefaultParameters`: parameters whose value differs from the job's current default. `jenkins_get_build` returns all `parameters`, plus `causes`, `builtOn`, `queueId`, `changes` and `artifacts` (first 20; use `artifact_filter` to search them).
+
+`jenkins_search_builds`
+
+- `result`: `SUCCESS`, `FAILURE`, `UNSTABLE`, `ABORTED`, `NOT_BUILT`, or `BUILDING`
+- `params`: `key=value` (equal), `key!=value` (not equal), `key~=regex` (RE2 match); `key=` matches an empty or unset parameter
+- `limit` (default 5), `max_lookback` (default 100, may exceed 100)
+
+`jenkins_get_running_builds` lists running builds (`jobName`, `buildNumber`, `url`, `node`, `startTime`, `duration`, `progress`) and `queuedBuilds` (`queueId`, `why`, ...).
+
+Job `color` values: `blue` success, `red` failed, `yellow` unstable, `aborted`, `disabled`, `notbuilt`/`grey` no result yet; a `_anime` suffix means a build is running.
+
+Timestamps are RFC3339 strings; durations are human-readable (`45s`, `2m5s`).
+
+## Running
+
+- `-url <jenkins_url>` (required)
+- `-auth "<user>:<api_token>"` or environment `JENKINS_MCP_AUTH` (the flag takes precedence)
+- `-stdio` (default) or `-http <addr>` for Streamable HTTP
+- `-cache-dir <dir>` log cache location, `none` to disable (see [Log cache](#log-cache))
+- `-version` prints the version and exits
+
+```sh
+JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com"
+JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com" -http :8080
 ```
 
-**Wait for Build Format**
-Build wait results returned by `jenkins_wait_for_running_build` include:
-```json
-{
-  "jobName": "job-name",
-  "buildNumber": 124,
-  "status": "success",
-  "result": "SUCCESS",
-  "duration": "2m0s",
-  "waitTime": "45s",
-  "timedOut": false
-}
-```
+Use an API token rather than a password. Tokens are exempt from Jenkins' CSRF protection; with a password the server fetches a crumb when Jenkins asks for one.
 
-Status values:
-- `success`: Build completed successfully
-- `failure`: Build failed
-- `unstable`: Build completed but with test failures or warnings
-- `aborted`: Build was manually aborted
-- `timeout`: Wait operation timed out before build completed
-- `unknown`: Build completed with an unrecognized result
+## Install / Build
 
-**Jenkins Color Codes**
-- `blue`: Last build was successful
-- `red`: Last build failed
-- `yellow`: Last build was unstable
-- `grey`: Job has never been built
-- `disabled`: Job is disabled
-- `aborted`: Last build was aborted
-- `*_anime`: Job is currently building (e.g., `blue_anime`)
-
-**Requirements**
-- CLI: `-url <jenkins_url>` (required) - Jenkins server URL
-- CLI: `-auth "<user>:<api_token>"` (optional) - Jenkins authentication credentials
-- ENV: `JENKINS_MCP_AUTH="<user>:<api_token>"` (optional) - Alternative to `-auth` flag
-- CLI: `-stdio` (default true) for stdio, or `-http <addr>` for Streamable HTTP.
-- CLI: `-version` prints the version and exits.
-
-**Authentication**
-Authentication can be provided in two ways:
-1. Command line flag: `-auth "user:token"`
-2. Environment variable: `JENKINS_MCP_AUTH="user:token"`
-
-If both are provided, the `-auth` flag takes precedence.
-
-**Install / Build**
 - Install: `go install github.com/simonfxr/go-jenkins-mcp@latest`
 - With Nix: `nix run github:simonfxr/go-jenkins-mcp -- -url ...` or `nix profile install github:simonfxr/go-jenkins-mcp`
-- Build from source: `go build` (produces `./go-jenkins-mcp`)
-- Run (stdio): execute with required parameters; an MCP host (e.g., Claude Desktop) should launch this binary with stdio wiring.
+- From source: `go build` (produces `./go-jenkins-mcp`), `go test ./...`
 
-Examples:
-- `JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com"`
-- HTTP mode: `JENKINS_MCP_AUTH="myuser:myapitoken" go-jenkins-mcp -url "https://jenkins.example.com" -http :8080`
+## Behaviour notes
 
-**Smithery / Hosts**
-- Configure your MCP host to run this server over stdio with the required parameters.
-
-**API Details**
-- Uses Jenkins REST API `/api/json` endpoint to fetch job list
-- Uses Jenkins REST API `/job/{jobName}/api/json` endpoint to fetch specific job details
-- Uses Jenkins REST API `/computer/api/json` endpoint to fetch running builds from executors
-- Uses Jenkins REST API `/queue/api/json` and `/queue/item/{queueId}/api/json` endpoints for queued builds and queue item tracking
-- Uses Jenkins REST API `/job/{jobName}/{buildNumber}/logText/progressiveText` endpoint for build logs
-- Implements smart tail log retrieval by calculating offset from total log size
-- Implements proper basic authentication and includes Jenkins CSRF crumb for build triggers when available
-- 30-second timeout for API calls, 60-second timeout for log retrieval
-- Graceful error handling for missing jobs/builds
-- Parses job names and build numbers from executor information
-- Supports nested jobs/folders via Jenkins path convention `/job/<seg>/job/<seg>/...` and proper URL escaping
-- Supports log pagination with offset and length parameters
-- Optimized tail log retrieval for quick failure analysis
-
-**Notes**
-- Input validation: enforces required URL and auth parameters
-- Auth format: must be "user:api_token" format
-- Errors: returned as tool results with `isError=true` for LLM visibility
-- Timestamps are RFC3339 strings; durations are human-readable (e.g., "45s", "2m5s")
-
-**Transport**
-- `-http <addr>` starts Streamable HTTP; otherwise `-stdio` runs by default.
-- If `-stdio=false` and no `-http` is provided, the server exits with an error.
-
-**TODO**
-- Add filtering options for `jenkins_get_jobs` (by job name pattern, status, etc.)
-- Add SSL certificate validation options
-- Optional `wait` behavior modes for `jenkins_start_job`
+- Credentials are only ever sent to the configured `-url`; pasted URLs are reduced to their job path.
+- GET requests are retried on connection errors and HTTP 502/503/504. POST requests (start, stop) are never retried and their redirects are not followed, because Jenkins encodes the outcome in the redirect.
+- Jenkins' HTML error pages are reduced to a short text message.
+- Errors are returned as tool results with `isError=true` so the model can read them.
+- API calls time out after 30 seconds, log and artifact downloads after 5 minutes.

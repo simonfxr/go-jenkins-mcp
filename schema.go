@@ -32,8 +32,9 @@ func jsonschemaForExt[T any]() *jsonschema.Schema {
 		sch.Properties = make(map[string]*jsonschema.Schema)
 	}
 
-	for f := range t.Fields() {
-		if f.PkgPath != "" { // unexported
+	// VisibleFields also yields the promoted fields of embedded structs.
+	for _, f := range reflect.VisibleFields(t) {
+		if f.PkgPath != "" || f.Anonymous { // unexported, or the embedded struct itself
 			continue
 		}
 		jsonTag := f.Tag.Get("json")
